@@ -1,0 +1,177 @@
+mncs 0.13;
+
+// web.uri — request-target spans and validation (origin-form, v1).
+//
+// A `Uri` is a pair of spans into the caller-held wire buffer: the path
+// and the optional query. No bytes are copied and no heap string exists;
+// the producer buffer outlives every span by construction (the parser and
+// encoder take it as an explicit argument alongside).
+//
+// v1 accepts origin-form (`/path?query`) and the asterisk-form (`*` for
+// OPTIONS). Absolute-form and authority-form are rejected (BadTarget):
+// proxying is future work, documented in ARCHITECTURE.md.
+module web.uri.v1;
+
+record Uri {
+    path_start: u64,
+    path_len: u64,
+    query_start: u64,
+    query_len: u64,
+    has_query: bool
+}
+
+record TargetOut { uri: Uri, valid: u64 }
+
+fn byte_at(buf: [byte; up_to 1024], buflen: u64, idx: u64) -> (result: byte) {
+    if buf.len == 0 {
+        return 0;
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if idx < hlen {
+        return buf[idx];
+    }
+    return 0;
+}
+
+fn empty_uri() -> (result: Uri) {
+    return Uri {
+        path_start: 0,
+        path_len: 0,
+        query_start: 0,
+        query_len: 0,
+        has_query: false
+    };
+}
+
+// CTL bytes (0x00-0x1F, 0x7F) and SP never appear in a valid target.
+// DEL and C0/C1 controls included; bytes >= 0x80 pass through here and
+// are the UTF-8/obs-text policy of a later tranche.
+fn byte_allowed(value: byte) -> (result: bool) {
+    let n: i64 = value as i64;
+    if n <= 32 {
+        return false;
+    }
+    if n == 127 {
+        return false;
+    }
+    return true;
+}
+
+// Split [start, start+len) at the first '?'. valid codes:
+// 0 = ok, 1 = empty, 2 = bad first byte, 3 = forbidden byte,
+// 4 = absolute-form (proxy targets out of scope in v1).
+fn split_target(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64
+) -> (result: TargetOut) {
+    if len == 0 {
+        return TargetOut { uri: empty_uri(), valid: 1 };
+    }
+    if buf.len == 0 {
+        return TargetOut { uri: empty_uri(), valid: 1 };
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if start >= hlen || start +% len > hlen {
+        return TargetOut { uri: empty_uri(), valid: 1 };
+    }
+    let first: byte = byte_at(buf, buflen, start);
+    if len == 1 && first == 42 {
+        let only: Uri = Uri {
+            path_start: start,
+            path_len: 1,
+            query_start: 0,
+            query_len: 0,
+            has_query: false
+        };
+        return TargetOut { uri: only, valid: 0 };
+    }
+    if first != 47 {
+        return TargetOut { uri: empty_uri(), valid: 2 };
+    }
+    iterate i over buf carrying acc: TargetOut = TargetOut { uri: empty_uri(), valid: 0 } {
+        // The hlen gate keeps this total even for a hostile `len`: slot
+        // can never reach past the valid window (start/i are small, so
+        // start +% i cannot wrap here).
+        let live: bool = i < len && start +% i < hlen;
+        let slot: u64 = select(live, start +% i, 0);
+        let byte: byte = buf[slot];
+        next acc = extend_target(acc, buf, buflen, start, i, slot, byte, live);
+    }
+    return acc;
+}
+
+fn extend_target(
+    acc: TargetOut,
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    start: u64,
+    i: u64,
+    slot: u64,
+    byte: byte,
+    live: bool
+) -> (result: TargetOut) {
+    if !live {
+        return acc;
+    }
+    if acc.valid != 0 {
+        return acc;
+    }
+    if !byte_allowed(byte) {
+        return TargetOut { uri: empty_uri(), valid: 3 };
+    }
+    if byte == 63 && !acc.uri.has_query {
+        let split: Uri = Uri {
+            path_start: start,
+            path_len: i,
+            query_start: slot +% 1,
+            query_len: 0,
+            has_query: true
+        };
+        return TargetOut { uri: split, valid: 0 };
+    }
+    if byte == 63 && acc.uri.has_query {
+        return extend_query(acc, 1);
+    }
+    // Detect "://" (absolute-form): a ':' followed by "//" at any point
+    // in the authority prefix rejects the target for v1.
+    if byte == 58 && has_scheme_suffix(buf, buflen, slot) {
+        return TargetOut { uri: empty_uri(), valid: 4 };
+    }
+    if acc.uri.has_query {
+        return extend_query(acc, 1);
+    }
+    return extend_path(acc, start, i);
+}
+
+fn extend_query(acc: TargetOut, extra: u64) -> (result: TargetOut) {
+    let grown: Uri = Uri {
+        path_start: acc.uri.path_start,
+        path_len: acc.uri.path_len,
+        query_start: acc.uri.query_start,
+        query_len: acc.uri.query_len +% extra,
+        has_query: true
+    };
+    return TargetOut { uri: grown, valid: 0 };
+}
+
+fn extend_path(acc: TargetOut, start: u64, i: u64) -> (result: TargetOut) {
+    let grown: Uri = Uri {
+        path_start: start,
+        path_len: i +% 1,
+        query_start: 0,
+        query_len: 0,
+        has_query: false
+    };
+    return TargetOut { uri: grown, valid: 0 };
+}
+
+fn has_scheme_suffix(buf: [byte; up_to 1024], buflen: u64, colon: u64) -> (result: bool) {
+    return byte_at(buf, buflen, colon +% 1) == 47
+        && byte_at(buf, buflen, colon +% 2) == 47;
+}
+
+fn has_query(uri: Uri) -> (result: bool) {
+    return uri.has_query;
+}

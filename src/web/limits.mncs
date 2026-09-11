@@ -1,0 +1,108 @@
+mncs 0.13;
+
+// web.limits — explicit resource bounds for the protocol boundary.
+//
+// A web stack is a security boundary: every byte of peer-controlled input
+// is processed under a `Limits` value. Limits are runtime data (so tests
+// and deployments can tighten them), but they can never exceed the static
+// structural capacities of this build (`static_*` below), which come from
+// fixed sequence widths. `clamp_limits` enforces that ordering, so a
+// hostile or mistaken configuration fails closed instead of widening the
+// attack surface.
+//
+// Static capacities (structural, Profile 0.13 sequence ceiling):
+//   wire buffer      1024 bytes  (request head + body window)
+//   header block     32 headers
+//   feed chunk       256 bytes   (incremental parser staging step)
+//   encoder output   1024 bytes
+//   reason slot      32 bytes
+//   method slot      8 bytes
+module web.limits.v1;
+
+record Limits {
+    max_start_line: u64,
+    max_header_line: u64,
+    max_headers: u64,
+    max_head_bytes: u64,
+    max_body_bytes: u64
+}
+
+fn static_wire() -> (result: u64) {
+    return 1024;
+}
+
+fn static_headers() -> (result: u64) {
+    return 32;
+}
+
+fn static_chunk() -> (result: u64) {
+    return 256;
+}
+
+fn static_output() -> (result: u64) {
+    return 1024;
+}
+
+// Production default. Fits comfortably inside the static capacities while
+// leaving headroom for realistic request lines and header blocks.
+fn default_limits() -> (result: Limits) {
+    return Limits {
+        max_start_line: 512,
+        max_header_line: 512,
+        max_headers: 32,
+        max_head_bytes: 1024,
+        max_body_bytes: 1024
+    };
+}
+
+// Minimal limits useful for exercising every limit error on tiny inputs.
+fn tiny_limits() -> (result: Limits) {
+    return Limits {
+        max_start_line: 16,
+        max_header_line: 16,
+        max_headers: 2,
+        max_head_bytes: 32,
+        max_body_bytes: 8
+    };
+}
+
+// Flat-boundary constructor: corpus-facing callers build Limits from five
+// scalars instead of fragile record-identity JSON.
+fn limits_make(
+    max_start_line: u64,
+    max_header_line: u64,
+    max_headers: u64,
+    max_head_bytes: u64,
+    max_body_bytes: u64
+) -> (result: Limits) {
+    return clamp_limits(Limits {
+        max_start_line: max_start_line,
+        max_header_line: max_header_line,
+        max_headers: max_headers,
+        max_head_bytes: max_head_bytes,
+        max_body_bytes: max_body_bytes
+    });
+}
+
+fn min_bound(left: u64, right: u64) -> (result: u64) {
+    return select(left <= right, left, right);
+}
+
+// A limit above its static capacity is a configuration defect: clamp it
+// shut rather than letting the parser enforce a bound the buffers cannot
+// actually hold (or vice versa: a zero limit would reject everything, so
+// floor at 1 to keep "configured" meaning "usable but tight").
+fn clamp_floor(value: u64, cap: u64) -> (result: u64) {
+    let capped: u64 = min_bound(value, cap);
+    return select(capped >= 1, capped, 1);
+}
+
+fn clamp_limits(limits: Limits) -> (result: Limits) {
+    return Limits {
+        max_start_line: clamp_floor(limits.max_start_line, 1024),
+        max_header_line: clamp_floor(limits.max_header_line, 1024),
+        max_headers: clamp_floor(limits.max_headers, 32),
+        max_head_bytes: clamp_floor(limits.max_head_bytes, 1024),
+        max_body_bytes: clamp_floor(limits.max_body_bytes, 1024)
+    };
+}

@@ -1,0 +1,76 @@
+mncs 0.13;
+
+// web.status — HTTP status code modeling.
+//
+// Status codes stay numeric (`u16`, 100..=599): the code IS the model and
+// the class is arithmetic (`code / 100`). `reason` maps the codes this
+// server can emit to their standard reason phrases in a padded 32-byte
+// slot; unknown-but-valid codes encode with "Unknown" so extension codes
+// keep working. Codes outside 100..=599 are never produced by the parser
+// and are rejected by `is_valid`.
+module web.status.v1;
+
+record ReasonOut { data: [byte; 32], length: u64 }
+
+fn is_valid(code: u16) -> (result: bool) {
+    return code >= 100 && code <= 599;
+}
+
+// 1..=5 for valid codes, 0 for anything else.
+fn class_of(code: u16) -> (result: u64) {
+    if code >= 100 && code <= 199 {
+        return 1;
+    }
+    if code >= 200 && code <= 299 {
+        return 2;
+    }
+    if code >= 300 && code <= 399 {
+        return 3;
+    }
+    if code >= 400 && code <= 499 {
+        return 4;
+    }
+    if code >= 500 && code <= 599 {
+        return 5;
+    }
+    return 0;
+}
+
+fn is_success(code: u16) -> (result: bool) {
+    return class_of(code) == 2;
+}
+
+fn is_client_error(code: u16) -> (result: bool) {
+    return class_of(code) == 4;
+}
+
+fn is_server_error(code: u16) -> (result: bool) {
+    return class_of(code) == 5;
+}
+
+// Standard reason phrase for codes this server emits. The slot is padded
+// with zeros; `length` marks the live prefix.
+fn reason(code: u16) -> (result: ReasonOut) {
+    return match code {
+        200 => ReasonOut { data: [79, 75, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 2 },
+        201 => ReasonOut { data: [67, 114, 101, 97, 116, 101, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 7 },
+        204 => ReasonOut { data: [78, 111, 32, 67, 111, 110, 116, 101, 110, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 10 },
+        301 => ReasonOut { data: [77, 111, 118, 101, 100, 32, 80, 101, 114, 109, 97, 110, 101, 110, 116, 108, 121, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 17 },
+        400 => ReasonOut { data: [66, 97, 100, 32, 82, 101, 113, 117, 101, 115, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 11 },
+        404 => ReasonOut { data: [78, 111, 116, 32, 70, 111, 117, 110, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 9 },
+        405 => ReasonOut { data: [77, 101, 116, 104, 111, 100, 32, 78, 111, 116, 32, 65, 108, 108, 111, 119, 101, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 18 },
+        411 => ReasonOut { data: [76, 101, 110, 103, 116, 104, 32, 82, 101, 113, 117, 105, 114, 101, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 15 },
+        413 => ReasonOut { data: [67, 111, 110, 116, 101, 110, 116, 32, 84, 111, 111, 32, 76, 97, 114, 103, 101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 17 },
+        414 => ReasonOut { data: [85, 82, 73, 32, 84, 111, 111, 32, 76, 111, 110, 103, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 12 },
+        431 => ReasonOut { data: [72, 101, 97, 100, 101, 114, 32, 84, 111, 111, 32, 76, 97, 114, 103, 101, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 16 },
+        500 => ReasonOut { data: [73, 110, 116, 101, 114, 110, 97, 108, 32, 83, 101, 114, 118, 101, 114, 32, 69, 114, 114, 111, 114, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 21 },
+        501 => ReasonOut { data: [78, 111, 116, 32, 73, 109, 112, 108, 101, 109, 101, 110, 116, 101, 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 15 },
+        505 => ReasonOut { data: [72, 84, 84, 80, 32, 86, 101, 114, 115, 105, 111, 110, 32, 78, 111, 116, 32, 83, 117, 112, 112, 111, 114, 116, 101, 100, 0, 0, 0, 0, 0, 0], length: 26 },
+        _ => ReasonOut { data: [85, 110, 107, 110, 111, 119, 110, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], length: 7 },
+    };
+}
+
+// The 505 phrase needs 26 bytes; guard the slot width in one place.
+fn reason_slot() -> (result: u64) {
+    return 32;
+}

@@ -1,0 +1,290 @@
+mncs 0.13;
+
+// web.app — request -> route -> handler -> response vertical slice.
+//
+// `serve_once` composes the whole foundation in one call: parse the head,
+// match the default route table, dispatch to a demo handler, and encode
+// the response. Handler bodies are fixed 256-byte buffers built by
+// `widen32` (small literal bodies) or `user_body` (one bounded span
+// splice for the `:id` parameter). Error mapping turns parse failures
+// into the status code from web.error (`status_for_code`) with a fixed
+// JSON rejection body.
+//
+// Serve-local codes in `ServeOut.error`: 0 means handled-or-routed
+// (including 404/405 responses); 1..=15 are web.error codes from a
+// failed parse; 98 means the input was a well-formed prefix that needs
+// more bytes (the server answers 400 since it cannot wait).
+module web.app.v1;
+
+use web.encode as encode;
+use web.error as error;
+use web.parser as parser;
+use web.router as router;
+
+record ServeOut {
+    status: u16,
+    content_type: u64,
+    body: [byte; 256],
+    body_len: u64,
+    error: u64,
+    handler: u64
+}
+
+record BodyOut { body: [byte; 256], len: u64, valid: bool }
+
+// Widen a small (<= 32 byte) literal body into the fixed handler slot.
+fn widen32(small: [byte; 32], len: u64) -> (result: BodyOut) {
+    if len > 32 {
+        return BodyOut { body: [0; 256], len: 0, valid: false };
+    }
+    let carrier: [byte; 256] = [0; 256];
+    iterate i over carrier carrying acc: BodyAcc = BodyAcc { body: carrier, len: len } {
+        let live: bool = i < len;
+        let slot: u64 = select(live, i, 0);
+        next acc = BodyAcc {
+            body: replace(acc.body, i, select(live, small[slot], 0)),
+            len: acc.len
+        };
+    }
+    return BodyOut { body: acc.body, len: acc.len, valid: true };
+}
+
+record BodyAcc { body: [byte; 256], len: u64 }
+
+// {"status":"ok"} (15)
+fn body_health() -> (result: BodyOut) {
+    let raw: [byte; 32] = [123, 34, 115, 116, 97, 116, 117, 115, 34, 58, 34, 111, 107, 34, 125, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return widen32(raw, 15);
+}
+
+// {"users":[]} (12)
+fn body_users() -> (result: BodyOut) {
+    let raw: [byte; 32] = [123, 34, 117, 115, 101, 114, 115, 34, 58, 91, 93, 125, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return widen32(raw, 12);
+}
+
+// {"created":true} (16)
+fn body_created() -> (result: BodyOut) {
+    let raw: [byte; 32] = [123, 34, 99, 114, 101, 97, 116, 101, 100, 34, 58, 116, 114, 117, 101, 125, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return widen32(raw, 16);
+}
+
+// {"web":"0.1.0"} (15)
+fn body_version() -> (result: BodyOut) {
+    let raw: [byte; 32] = [123, 34, 119, 101, 98, 34, 58, 34, 48, 46, 49, 46, 48, 34, 125, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return widen32(raw, 15);
+}
+
+// {"error":404} (13)
+fn body_not_found() -> (result: BodyOut) {
+    let raw: [byte; 32] = [123, 34, 101, 114, 114, 111, 114, 34, 58, 52, 48, 52, 125, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return widen32(raw, 13);
+}
+
+// {"error":405} (13)
+fn body_method_not_allowed() -> (result: BodyOut) {
+    let raw: [byte; 32] = [123, 34, 101, 114, 114, 111, 114, 34, 58, 52, 48, 53, 125, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    return widen32(raw, 13);
+}
+
+// {"error":"request rejected"} (28)
+fn body_rejected() -> (result: BodyOut) {
+    let raw: [byte; 32] = [123, 34, 101, 114, 114, 111, 114, 34, 58, 34, 114, 101, 113, 117, 101, 115, 116, 32, 114, 101, 106, 101, 99, 116, 101, 100, 34, 125, 0, 0, 0, 0];
+    return widen32(raw, 28);
+}
+
+// {"id":"<param>"} with one bounded splice. Params longer than 216 bytes
+// do not fit the 256-byte handler slot and are refused (valid=false;
+// the server answers 414).
+fn user_body(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    pstart: u64,
+    plen: u64
+) -> (result: BodyOut) {
+    if plen > 216 {
+        return BodyOut { body: [0; 256], len: 0, valid: false };
+    }
+    if buf.len == 0 {
+        return BodyOut { body: [0; 256], len: 0, valid: false };
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if pstart >= hlen || pstart +% plen > hlen {
+        return BodyOut { body: [0; 256], len: 0, valid: false };
+    }
+    let total: u64 = plen +% 9;
+    let carrier: [byte; 256] = [0; 256];
+    iterate i over carrier carrying acc: [byte; 256] = carrier {
+        next acc = replace(acc, i, user_byte(buf, hlen, pstart, plen, i));
+    }
+    return BodyOut { body: acc, len: total, valid: true };
+}
+
+// Position map: [0..7) prefix {"id":"  [7..7+plen) param  [7+plen..9+plen) "}
+fn user_byte(
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    pstart: u64,
+    plen: u64,
+    i: u64
+) -> (result: byte) {
+    if i >= plen +% 9 {
+        return 0;
+    }
+    if i < 7 {
+        return prefix_byte(i);
+    }
+    if i < plen +% 7 {
+        return buf[pstart +% (i -% 7)];
+    }
+    return suffix_byte(i -% (plen +% 7));
+}
+
+fn prefix_byte(i: u64) -> (result: byte) {
+    if i == 0 {
+        return 123;
+    }
+    if i == 1 {
+        return 34;
+    }
+    if i == 2 {
+        return 105;
+    }
+    if i == 3 {
+        return 100;
+    }
+    if i == 4 {
+        return 34;
+    }
+    if i == 5 {
+        return 58;
+    }
+    return 34;
+}
+
+fn suffix_byte(i: u64) -> (result: byte) {
+    if i == 0 {
+        return 34;
+    }
+    return 125;
+}
+
+// ---- dispatch and the serve boundary.
+
+fn dispatch(
+    handler: u64,
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    pstart: u64,
+    plen: u64,
+    has_param: bool
+) -> (result: ServeOut) {
+    return match handler {
+        0 => serve_body(200, 2, body_health(), handler),
+        1 => serve_body(200, 2, body_users(), handler),
+        2 => serve_user(buf, buflen, pstart, plen, has_param, handler),
+        3 => serve_body(201, 2, body_created(), handler),
+        4 => serve_body(200, 2, body_version(), handler),
+        _ => serve_body(404, 2, body_not_found(), handler),
+    };
+}
+
+fn serve_body(code: u16, content_type: u64, body: BodyOut, handler: u64) -> (result: ServeOut) {
+    if !body.valid {
+        return serve_rejected(500, 15, handler);
+    }
+    return ServeOut {
+        status: code,
+        content_type: content_type,
+        body: body.body,
+        body_len: body.len,
+        error: 0,
+        handler: handler
+    };
+}
+
+fn serve_user(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    pstart: u64,
+    plen: u64,
+    has_param: bool,
+    handler: u64
+) -> (result: ServeOut) {
+    if !has_param {
+        return serve_body(404, 2, body_not_found(), handler);
+    }
+    let built: BodyOut = user_body(buf, buflen, pstart, plen);
+    if !built.valid {
+        // Oversize handler input trips the same bound family as an
+        // oversize body (see error 13); the status stays exact at 414.
+        return serve_rejected(414, 13, handler);
+    }
+    return serve_body(200, 2, built, handler);
+}
+
+fn serve_rejected(code: u16, err: u64, handler: u64) -> (result: ServeOut) {
+    let body: BodyOut = body_rejected();
+    return ServeOut {
+        status: code,
+        content_type: 2,
+        body: body.body,
+        body_len: body.len,
+        error: err,
+        handler: handler
+    };
+}
+
+fn serve_parse_error(err: u64) -> (result: ServeOut) {
+    let code: u16 = error.status_for_code(err);
+    return serve_rejected(code, err, 255);
+}
+
+// The vertical slice: parse -> route -> dispatch. Responses are encoded
+// by the host from ServeOut via encode.respond; this boundary stays at
+// the model level so corpus assertions read fields, not bytes.
+fn serve_once(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    max_start_line: u64,
+    max_header_line: u64,
+    max_headers: u64,
+    max_head_bytes: u64,
+    max_body_bytes: u64
+) -> (result: ServeOut) {
+    let parsed: parser.ParseOut = parser.parse_request(
+        buf, buflen, max_start_line, max_header_line, max_headers, max_head_bytes, max_body_bytes
+    );
+    if parsed.kind == 1 {
+        return serve_rejected(400, 98, 255);
+    }
+    if parsed.kind == 2 {
+        return serve_parse_error(parsed.error);
+    }
+    let route: router.RouteOut = router.match_default(
+        buf, buflen, parsed.head.method, parsed.head.target.path_start, parsed.head.target.path_len
+    );
+    if !route.found && route.path_exists {
+        return serve_body(405, 2, body_method_not_allowed(), 255);
+    }
+    if !route.found {
+        return serve_body(404, 2, body_not_found(), 255);
+    }
+    return dispatch(route.handler, buf, buflen, route.param_start, route.param_len, route.has_param);
+}
+
+// Flat wire-level entry: serve and immediately encode the response, so
+// one corpus call exercises the full client-visible round trip.
+fn serve_bytes(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    max_start_line: u64,
+    max_header_line: u64,
+    max_headers: u64,
+    max_head_bytes: u64,
+    max_body_bytes: u64
+) -> (result: encode.EncodeOut) {
+    let served: ServeOut = serve_once(buf, buflen, max_start_line, max_header_line, max_headers, max_head_bytes, max_body_bytes);
+    let held: [byte; 256] = served.body;
+    return encode.respond(served.status, served.content_type, held, served.body_len);
+}

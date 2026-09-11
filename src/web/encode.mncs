@@ -1,0 +1,325 @@
+mncs 0.13;
+
+// web.encode — HTTP/1.x request/response serializers.
+//
+// The encoder is the parser's inverse: it renders heads back into wire
+// bytes. Emission threads an `Emit` cursor (fixed 1024-byte buffer plus
+// length); overflow saturates and reports `truncated` instead of
+// trapping, so a too-small build never becomes a memory error.
+//
+// Deliberate O(n*m) shape note: without a bulk slice-copy primitive,
+// every byte is placed with one `replace`. The code is correct and
+// bounded, but a `copy_span` primitive would collapse each span emission
+// from O(cap) replaces to one. See pressure WEB-P-003.
+module web.encode.v1;
+
+use web.headers as headers;
+use web.message as message;
+use web.method as method;
+use web.status as status;
+use web.uri as uri;
+use web.version as version;
+
+record Emit { data: [byte; 1024], len: u64, truncated: bool }
+
+record EncodeOut { data: [byte; 1024], length: u64, truncated: bool }
+
+fn emit_new() -> (result: Emit) {
+    return Emit { data: [0; 1024], len: 0, truncated: false };
+}
+
+fn emit_byte(e: Emit, value: byte) -> (result: Emit) {
+    if e.len >= 1024 {
+        return Emit { data: e.data, len: e.len, truncated: true };
+    }
+    return Emit { data: replace(e.data, e.len, value), len: e.len +% 1, truncated: e.truncated };
+}
+
+fn emit_crlf(e: Emit) -> (result: Emit) {
+    return emit_byte(emit_byte(e, 13), 10);
+}
+
+fn emit_space(e: Emit) -> (result: Emit) {
+    return emit_byte(e, 32);
+}
+
+// Copy [start, start+len) from src. Spans come from the parser, so they
+// are in-bounds by construction; the hlen gate keeps this total even if
+// a caller passes a corrupt span (truncation, never a trap).
+fn emit_span(
+    e: Emit,
+    src: [byte; up_to 1024],
+    srclen: u64,
+    start: u64,
+    len: u64
+) -> (result: Emit) {
+    if src.len == 0 {
+        return e;
+    }
+    let hlen: u64 = select(srclen <= src.len, srclen, src.len);
+    iterate i over src carrying acc: Emit = e {
+        let live: bool = i < len && start +% i < hlen;
+        let slot: u64 = select(live, start +% i, 0);
+        next acc = select(live, emit_byte(acc, src[slot]), acc);
+    }
+    return acc;
+}
+
+// Emit the live prefix of an 8-byte table slot (method/version text).
+fn emit_slot8(e: Emit, data: [byte; 8], len: u64) -> (result: Emit) {
+    let slots: [byte; 8] = [0; 8];
+    iterate i over slots carrying acc: Emit = e {
+        let live: bool = i < len;
+        let slot: u64 = select(live, i, 0);
+        next acc = select(live, emit_byte(acc, data[slot]), acc);
+    }
+    return acc;
+}
+
+// Emit the live prefix of the 32-byte reason slot.
+fn emit_slot32(e: Emit, data: [byte; 32], len: u64) -> (result: Emit) {
+    let slots: [byte; 32] = [0; 32];
+    iterate i over slots carrying acc: Emit = e {
+        let live: bool = i < len;
+        let slot: u64 = select(live, i, 0);
+        next acc = select(live, emit_byte(acc, data[slot]), acc);
+    }
+    return acc;
+}
+
+fn emit_method(e: Emit, code: u64) -> (result: Emit) {
+    let t: method.MethodText = method.text(method.method_of(code));
+    return emit_slot8(e, t.data, t.length);
+}
+
+fn emit_version(e: Emit, code: u64) -> (result: Emit) {
+    let clean: u64 = select(code == 0, 0, 1);
+    if clean == 0 {
+        let t0: version.VersionText = version.text_of(0);
+        return emit_slot8(e, t0.data, t0.length);
+    }
+    let t1: version.VersionText = version.text_of(1);
+    return emit_slot8(e, t1.data, t1.length);
+}
+
+fn emit_reason(e: Emit, code: u16) -> (result: Emit) {
+    let r: status.ReasonOut = status.reason(code);
+    return emit_slot32(e, r.data, r.length);
+}
+
+// Decimal, no leading zeros, total over u64 (20 places cover u64max).
+fn emit_digits(e: Emit, value: u64) -> (result: Emit) {
+    let places: [u64; 20] = [
+        10000000000000000000, 1000000000000000000, 100000000000000000,
+        10000000000000000, 1000000000000000, 100000000000000,
+        10000000000000, 1000000000000, 100000000000, 10000000000,
+        1000000000, 100000000, 10000000, 1000000, 100000, 10000,
+        1000, 100, 10, 1
+    ];
+    iterate i over places carrying acc: DigAcc = DigAcc { emit: e, seen: false } {
+        let place: u64 = places[i];
+        let digit: u64 = (value / place) % 10;
+        let nonzero: bool = !(digit == 0);
+        let show: bool = acc.seen || nonzero || i == 19;
+        let grown: Emit = emit_byte(acc.emit, (digit +% 48) as byte);
+        next acc = DigAcc { emit: select(show, grown, acc.emit), seen: acc.seen || nonzero };
+    }
+    return acc.emit;
+}
+
+record DigAcc { emit: Emit, seen: bool }
+
+// "Content-Length: <n>\r\n"
+fn emit_content_length(e: Emit, value: u64) -> (result: Emit) {
+    let a0: Emit = emit_span(e, header_name_cl(), 14, 0, 14);
+    let a1: Emit = emit_byte(emit_byte(a0, 58), 32);
+    return emit_crlf(emit_digits(a1, value));
+}
+
+fn header_name_cl() -> (result: [byte; up_to 1024]) {
+    let raw: [byte; 14] = [67, 111, 110, 116, 101, 110, 116, 45, 76, 101, 110, 103, 116, 104];
+    return raw;
+}
+
+fn emit_content_type(e: Emit, kind: u64) -> (result: Emit) {
+    if kind == 1 {
+        let a0: Emit = emit_span(e, header_name_ct(), 12, 0, 12);
+        let a1: Emit = emit_byte(emit_byte(a0, 58), 32);
+        let a2: Emit = emit_span(a1, mime_text(), 10, 0, 10);
+        return emit_crlf(a2);
+    }
+    if kind == 2 {
+        let b0: Emit = emit_span(e, header_name_ct(), 12, 0, 12);
+        let b1: Emit = emit_byte(emit_byte(b0, 58), 32);
+        let b2: Emit = emit_span(b1, mime_json(), 16, 0, 16);
+        return emit_crlf(b2);
+    }
+    return e;
+}
+
+fn header_name_ct() -> (result: [byte; up_to 1024]) {
+    let raw: [byte; 12] = [67, 111, 110, 116, 101, 110, 116, 45, 84, 121, 112, 101];
+    return raw;
+}
+
+fn mime_text() -> (result: [byte; up_to 1024]) {
+    let raw: [byte; 10] = [116, 101, 120, 116, 47, 112, 108, 97, 105, 110];
+    return raw;
+}
+
+fn mime_json() -> (result: [byte; up_to 1024]) {
+    let raw: [byte; 16] = [97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111, 110];
+    return raw;
+}
+
+fn emit_connection_close(e: Emit) -> (result: Emit) {
+    let a0: Emit = emit_span(e, header_name_conn(), 10, 0, 10);
+    let a1: Emit = emit_byte(emit_byte(a0, 58), 32);
+    let a2: Emit = emit_span(a1, conn_close(), 5, 0, 5);
+    return emit_crlf(a2);
+}
+
+fn header_name_conn() -> (result: [byte; up_to 1024]) {
+    let raw: [byte; 10] = [67, 111, 110, 110, 101, 99, 116, 105, 111, 110];
+    return raw;
+}
+
+fn conn_close() -> (result: [byte; up_to 1024]) {
+    let raw: [byte; 5] = [99, 108, 111, 115, 101];
+    return raw;
+}
+
+// ---- request encoding: renders a parsed head back to wire bytes using
+// the source buffer for every span (the parser's inverse).
+
+fn emit_head_headers(
+    e: Emit,
+    src: [byte; up_to 1024],
+    srclen: u64,
+    block: headers.HeaderBlock
+) -> (result: Emit) {
+    iterate i over block.headers carrying acc: Emit = e {
+        let live: bool = i < block.count;
+        let slot: u64 = select(live, i, 0);
+        let header: headers.Header = block.headers[slot];
+        next acc = emit_one_header(acc, src, srclen, header, live);
+    }
+    return acc;
+}
+
+fn emit_one_header(
+    e: Emit,
+    src: [byte; up_to 1024],
+    srclen: u64,
+    header: headers.Header,
+    live: bool
+) -> (result: Emit) {
+    if !live {
+        return e;
+    }
+    let a0: Emit = emit_span(e, src, srclen, header.name_start, header.name_len);
+    let a1: Emit = emit_byte(emit_byte(a0, 58), 32);
+    let a2: Emit = emit_span(a1, src, srclen, header.value_start, header.value_len);
+    return emit_crlf(a2);
+}
+
+fn finish_emit(e: Emit) -> (result: EncodeOut) {
+    return EncodeOut { data: e.data, length: e.len, truncated: e.truncated };
+}
+
+fn encode_request(
+    src: [byte; up_to 1024],
+    srclen: u64,
+    head: message.RequestHead
+) -> (result: EncodeOut) {
+    let block: headers.HeaderBlock = head.headers;
+    let m0: Emit = emit_new();
+    let m1: Emit = select(
+        head.method == 9,
+        emit_span(m0, src, srclen, head.ext_start, head.ext_len),
+        emit_method(m0, head.method)
+    );
+    let m2: Emit = emit_space(m1);
+    let m3: Emit = emit_span(m2, src, srclen, head.target.path_start, head.target.path_len);
+    let m4: Emit = emit_query(m3, src, srclen, head.target);
+    let m5: Emit = emit_space(m4);
+    let m6: Emit = emit_version(m5, head.version);
+    let m7: Emit = emit_crlf(m6);
+    let m8: Emit = emit_head_headers(m7, src, srclen, block);
+    let m9: Emit = emit_crlf(m8);
+    return finish_emit(emit_span(m9, src, srclen, head.body_start, head.body_len));
+}
+
+fn emit_query(
+    e: Emit,
+    src: [byte; up_to 1024],
+    srclen: u64,
+    target: uri.Uri
+) -> (result: Emit) {
+    if !target.has_query {
+        return e;
+    }
+    let q0: Emit = emit_byte(e, 63);
+    return emit_span(q0, src, srclen, target.query_start, target.query_len);
+}
+
+// ---- response encoding: status line + framing headers + body.
+
+fn encode_response(
+    version: u64,
+    code: u16,
+    content_type: u64,
+    body: [byte; 256],
+    body_len: u64
+) -> (result: EncodeOut) {
+    let held: [byte; 256] = body;
+    return encode_response_view(version, code, content_type, held, body_len);
+}
+
+fn encode_response_view(
+    version: u64,
+    code: u16,
+    content_type: u64,
+    body: [byte; up_to 1024],
+    body_len: u64
+) -> (result: EncodeOut) {
+    if body.len == 0 && body_len == 0 {
+        return encode_response_empty(version, code, content_type);
+    }
+    let hlen: u64 = select(body_len <= body.len, body_len, body.len);
+    let r0: Emit = emit_version(emit_new(), version);
+    let r1: Emit = emit_space(r0);
+    let r2: Emit = emit_digits(r1, code as u64);
+    let r3: Emit = emit_space(r2);
+    let r4: Emit = emit_crlf(emit_reason(r3, code));
+    let r5: Emit = emit_content_length(r4, hlen);
+    let r6: Emit = emit_content_type(r5, content_type);
+    let r7: Emit = emit_connection_close(r6);
+    let r8: Emit = emit_crlf(r7);
+    return finish_emit(emit_span(r8, body, hlen, 0, hlen));
+}
+
+fn encode_response_empty(version: u64, code: u16, content_type: u64) -> (result: EncodeOut) {
+    let r0: Emit = emit_version(emit_new(), version);
+    let r1: Emit = emit_space(r0);
+    let r2: Emit = emit_digits(r1, code as u64);
+    let r3: Emit = emit_space(r2);
+    let r4: Emit = emit_crlf(emit_reason(r3, code));
+    let r5: Emit = emit_content_length(r4, 0);
+    let r6: Emit = emit_content_type(r5, content_type);
+    let r7: Emit = emit_connection_close(r6);
+    let r8: Emit = emit_crlf(r7);
+    return finish_emit(r8);
+}
+
+// Single-call responder used by the demo handlers and the round-trip
+// corpus: HTTP/1.1, explicit status, explicit content type (0 none,
+// 1 text/plain, 2 application/json), fixed 256-byte body slot.
+fn respond(
+    code: u16,
+    content_type: u64,
+    body: [byte; 256],
+    body_len: u64
+) -> (result: EncodeOut) {
+    return encode_response(1, code, content_type, body, body_len);
+}

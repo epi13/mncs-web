@@ -1,0 +1,25 @@
+mncs 0.13;
+
+// Reproducer for WEB-P-005: integer literals coerce to the operand type
+// only on the RIGHT of a binary operator. `right_*` elaborate;
+// `left_*` fail with MNE119 (binary operands must have the same type).
+//
+// mncs-web workaround: keep every literal on the right
+// (`(kind *% 10) +% err +% 1000`), see src/web/roundtrip.mncs.
+module repro.literal_left_coercion;
+
+fn right_small(x: u64) -> (result: u64) {
+    return x +% 1;
+}
+
+fn left_small(x: u64) -> (result: u64) {
+    return 1 +% x;
+}
+
+fn right_big(x: u64) -> (result: u64) {
+    return x +% 1000;
+}
+
+fn left_big(x: u64) -> (result: u64) {
+    return 1000 +% x;
+}

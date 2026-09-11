@@ -1,0 +1,100 @@
+mncs 0.13;
+
+// web.transport — memory-backed byte pipes with backpressure as data.
+//
+// A `Pipe` is the v1 transport behind the Connection interface: a fixed
+// 1024-byte staging buffer with independent write and read cursors. There
+// are no threads, no blocking, and no sockets here. `pipe_write` reports
+// a full pipe as `blocked` (never a wait) and `pipe_read` reports an
+// empty pipe as `kind == 1` (never a block), mirroring the
+// mncs.std.channel.v1 contract style: the realization (host loop or test
+// driver) retries or cancels between attempts.
+//
+// v1 scope: one request/response exchange per pipe; there is no buffer
+// compaction, so a pipe is single-use by convention. Real socket,
+// file, and encrypted transports implement this same shape behind a host
+// capability once the language provides one (see pressure WEB-P-001).
+module web.transport.v1;
+
+record Pipe { data: [byte; 1024], length: u64, read_pos: u64 }
+
+record WriteOut { pipe: Pipe, accepted: bool, blocked: bool }
+
+record ReadOut { pipe: Pipe, data: [byte; 256], length: u64, kind: u64 }
+
+fn pipe_new() -> (result: Pipe) {
+    return Pipe { data: [0; 1024], length: 0, read_pos: 0 };
+}
+
+fn pipe_available(pipe: Pipe) -> (result: u64) {
+    return pipe.length -% pipe.read_pos;
+}
+
+fn pipe_free(pipe: Pipe) -> (result: u64) {
+    let cap: u64 = 1024;
+    return cap -% pipe.length;
+}
+
+// All-or-nothing write: when the chunk does not fit, nothing is staged
+// and `blocked` reports backpressure. Partial writes would complicate
+// the caller's framing without adding information.
+fn pipe_write(
+    pipe: Pipe,
+    chunk: [byte; up_to 256],
+    chunk_len: u64
+) -> (result: WriteOut) {
+    if chunk.len == 0 {
+        return WriteOut { pipe: pipe, accepted: true, blocked: false };
+    }
+    let take: u64 = clamp_take(chunk_len, chunk.len);
+    if take == 0 {
+        return WriteOut { pipe: pipe, accepted: true, blocked: false };
+    }
+    if pipe.length +% take > 1024 {
+        return WriteOut { pipe: pipe, accepted: false, blocked: true };
+    }
+    iterate j over chunk carrying acc: [byte; 1024] = pipe.data {
+        let live: bool = j < take;
+        let slot: u64 = select(live, pipe.length +% j, 0);
+        next acc = select(live, replace(acc, slot, chunk[j]), acc);
+    }
+    let grown: Pipe = Pipe { data: acc, length: pipe.length +% take, read_pos: pipe.read_pos };
+    return WriteOut { pipe: grown, accepted: true, blocked: false };
+}
+
+record StageAcc { staged: [byte; 1024], len: u64 }
+
+fn clamp_take(chunk_len: u64, have: u64) -> (result: u64) {
+    let bounded: u64 = select(chunk_len <= 256, chunk_len, 256);
+    return select(bounded <= have, bounded, have);
+}
+
+// Read up to `max` bytes (at most 256). `kind` is 0 with data and 1 when
+// the pipe holds nothing unread; `length` is always exact.
+fn pipe_read(pipe: Pipe, max: u64) -> (result: ReadOut) {
+    let want: u64 = select(max <= 256, max, 256);
+    let have: u64 = pipe_available(pipe);
+    let n: u64 = select(want <= have, want, have);
+    if n == 0 {
+        return ReadOut { pipe: pipe, data: [0; 256], length: 0, kind: 1 };
+    }
+    iterate k over pipe.data carrying acc: ReadAcc = ReadAcc { out: [0; 256], pipe: pipe } {
+        next acc = fold_read(acc, k, n);
+    }
+    return ReadOut {
+        pipe: Pipe { data: acc.pipe.data, length: acc.pipe.length, read_pos: acc.pipe.read_pos +% n },
+        data: acc.out,
+        length: n,
+        kind: 0
+    };
+}
+
+record ReadAcc { out: [byte; 256], pipe: Pipe }
+
+fn fold_read(acc: ReadAcc, k: u64, n: u64) -> (result: ReadAcc) {
+    let live: bool = k >= acc.pipe.read_pos && k < acc.pipe.read_pos +% n;
+    let slot: u64 = select(live, k -% acc.pipe.read_pos, 0);
+    let src: [byte; 1024] = acc.pipe.data;
+    let grown: [byte; 256] = replace(acc.out, slot, src[k]);
+    return ReadAcc { out: select(live, grown, acc.out), pipe: acc.pipe };
+}

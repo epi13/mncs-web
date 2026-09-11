@@ -1,0 +1,78 @@
+mncs 0.13;
+
+// web.version — HTTP protocol version modeling.
+//
+// v1 supports the two HTTP/1.x origin-form versions. The version travels
+// as `u64` (0 = HTTP/1.0, 1 = HTTP/1.1) because the wire encoding is
+// inherently numeric; `Version` exists so match sites stay exhaustive when
+// new versions arrive. There is deliberately no `version_of` total
+// fallback: an unsupported minor digit is a parse error (BadVersion), not
+// a silent alias, so invalid inputs can never be produced by `parse`.
+module web.version.v1;
+
+enum Version { HTTP10, HTTP11 }
+
+record VersionText { data: [byte; 8], length: u64 }
+
+fn byte_at(buf: [byte; up_to 1024], buflen: u64, idx: u64) -> (result: byte) {
+    if buf.len == 0 {
+        return 0;
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if idx < hlen {
+        return buf[idx];
+    }
+    return 0;
+}
+
+fn code_of(version: Version) -> (result: u64) {
+    return match version {
+        HTTP10 => 0,
+        HTTP11 => 1,
+    };
+}
+
+// Parse a terminated version token at [start, start+len): exactly
+// "HTTP/1.0" (0) or "HTTP/1.1" (1), anything else 2. The parser only calls
+// this once CR terminates the token, so an unterminated token at the end
+// of the buffer is "need more input", never a verdict from here.
+fn parse(buf: [byte; up_to 1024], start: u64, len: u64, buflen: u64) -> (result: u64) {
+    if len != 8 {
+        return 2;
+    }
+    if byte_at(buf, buflen, start) == 72
+        && byte_at(buf, buflen, start +% 1) == 84
+        && byte_at(buf, buflen, start +% 2) == 84
+        && byte_at(buf, buflen, start +% 3) == 80
+        && byte_at(buf, buflen, start +% 4) == 47
+        && byte_at(buf, buflen, start +% 5) == 49
+        && byte_at(buf, buflen, start +% 6) == 46 {
+        let minor: byte = byte_at(buf, buflen, start +% 7);
+        if minor == 48 {
+            return 0;
+        }
+        if minor == 49 {
+            return 1;
+        }
+        return 2;
+    }
+    return 2;
+}
+
+fn text(version: Version) -> (result: VersionText) {
+    return match version {
+        HTTP10 => VersionText { data: [72, 84, 84, 80, 47, 49, 46, 48], length: 8 },
+        HTTP11 => VersionText { data: [72, 84, 84, 80, 47, 49, 46, 49], length: 8 },
+    };
+}
+
+fn text_of(code: u64) -> (result: VersionText) {
+    if code == 0 {
+        return text(Version.HTTP10);
+    }
+    return text(Version.HTTP11);
+}
+
+fn is_supported(code: u64) -> (result: bool) {
+    return code == 0 || code == 1;
+}

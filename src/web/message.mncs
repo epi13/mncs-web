@@ -1,0 +1,234 @@
+mncs 0.13;
+
+// web.message — request/response head structures and body accounting.
+//
+// `RequestHead` / `ResponseHead` are the parser's output and the
+// encoder's input. Every variable-length field is a span into an explicit
+// caller buffer; the head itself is fixed-size and ABI-stable.
+//
+// Content-Length handling follows RFC 9110 §8.6: absent means "no body
+// framing declared" (v1: body length 0, connection-close bodies are out
+// of scope); multiple differing values invalidate the message; values
+// above u32 range are rejected rather than wrapped.
+module web.message.v1;
+
+use web.headers as headers;
+use web.uri as uri;
+
+record RequestHead {
+    method: u64,
+    ext_start: u64,
+    ext_len: u64,
+    target: uri.Uri,
+    version: u64,
+    headers: headers.HeaderBlock,
+    content_length: u64,
+    has_content_length: bool,
+    body_start: u64,
+    body_len: u64,
+    head_len: u64
+}
+
+record ResponseHead {
+    version: u64,
+    status: u16,
+    reason_start: u64,
+    reason_len: u64,
+    headers: headers.HeaderBlock,
+    body_start: u64,
+    body_len: u64
+}
+
+record DigOut { valid: bool, value: u64 }
+
+record CLOut { found: bool, length: u64, valid: bool }
+
+record CLScan {
+    seen: bool,
+    first: u64,
+    consistent: bool,
+    parse_ok: bool
+}
+
+fn byte_at(buf: [byte; up_to 1024], buflen: u64, idx: u64) -> (result: byte) {
+    if buf.len == 0 {
+        return 0;
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if idx < hlen {
+        return buf[idx];
+    }
+    return 0;
+}
+
+fn empty_request() -> (result: RequestHead) {
+    return RequestHead {
+        method: 9,
+        ext_start: 0,
+        ext_len: 0,
+        target: uri.empty_uri(),
+        version: 1,
+        headers: headers.empty_block(),
+        content_length: 0,
+        has_content_length: false,
+        body_start: 0,
+        body_len: 0,
+        head_len: 0
+    };
+}
+
+fn make_request(
+    method: u64,
+    ext_start: u64,
+    ext_len: u64,
+    target: uri.Uri,
+    version: u64,
+    block: headers.HeaderBlock,
+    content_length: u64,
+    has_content_length: bool,
+    body_start: u64,
+    body_len: u64,
+    head_len: u64
+) -> (result: RequestHead) {
+    return RequestHead {
+        method: method,
+        ext_start: ext_start,
+        ext_len: ext_len,
+        target: target,
+        version: version,
+        headers: block,
+        content_length: content_length,
+        has_content_length: has_content_length,
+        body_start: body_start,
+        body_len: body_len,
+        head_len: head_len
+    };
+}
+
+fn empty_response() -> (result: ResponseHead) {
+    return ResponseHead {
+        version: 1,
+        status: 200,
+        reason_start: 0,
+        reason_len: 0,
+        headers: headers.empty_block(),
+        body_start: 0,
+        body_len: 0
+    };
+}
+
+fn make_response(
+    version: u64,
+    status: u16,
+    reason_start: u64,
+    reason_len: u64,
+    block: headers.HeaderBlock,
+    body_start: u64,
+    body_len: u64
+) -> (result: ResponseHead) {
+    return ResponseHead {
+        version: version,
+        status: status,
+        reason_start: reason_start,
+        reason_len: reason_len,
+        headers: block,
+        body_start: body_start,
+        body_len: body_len
+    };
+}
+
+// Decimal digits, total: empty and non-digit spans are invalid (not zero),
+// and the accumulator refuses to cross u32 range instead of wrapping.
+// At most 10 digits can be valid; an 11th digit guarantees overflow.
+fn parse_digits(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64
+) -> (result: DigOut) {
+    if len == 0 || len > 10 {
+        return DigOut { valid: false, value: 0 };
+    }
+    if buf.len == 0 {
+        return DigOut { valid: false, value: 0 };
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if start >= hlen || start +% len > hlen {
+        return DigOut { valid: false, value: 0 };
+    }
+    iterate i over buf carrying acc: DigOut = DigOut { valid: true, value: 0 } {
+        let live: bool = i < len && acc.valid;
+        let slot: u64 = select(live, start +% i, 0);
+        next acc = extend_digits(acc, buf[slot], live);
+    }
+    return acc;
+}
+
+fn extend_digits(acc: DigOut, byte: byte, live: bool) -> (result: DigOut) {
+    if !live {
+        return acc;
+    }
+    let n: i64 = byte as i64;
+    if n < 48 || n > 57 {
+        return DigOut { valid: false, value: 0 };
+    }
+    // acc.value <= 4294967295 here would overflow on push; refuse first.
+    // 429496729 * 10 + 9 = 4294967299 > u32max, so values crossing the
+    // u32 ceiling fail closed instead of wrapping.
+    if acc.value > 429496729 {
+        return DigOut { valid: false, value: 0 };
+    }
+    let pushed: u64 = acc.value *% 10 +% ((byte as u64) -% 48);
+    if pushed > 4294967295 {
+        return DigOut { valid: false, value: 0 };
+    }
+    return DigOut { valid: true, value: pushed };
+}
+
+// Content-Length resolution over a completed header block. `found` is
+// false when no Content-Length field exists; `valid` is false when any
+// value is malformed or when two values disagree.
+fn content_length_of(
+    block: headers.HeaderBlock,
+    buf: [byte; up_to 1024],
+    buflen: u64
+) -> (result: CLOut) {
+    iterate i over block.headers carrying acc: CLScan = CLScan { seen: false, first: 0, consistent: true, parse_ok: true } {
+        let live: bool = i < block.count;
+        let slot: u64 = select(live, i, 0);
+        let header: headers.Header = block.headers[slot];
+        next acc = fold_cl(acc, buf, buflen, header, live);
+    }
+    if !acc.seen {
+        return CLOut { found: false, length: 0, valid: true };
+    }
+    return CLOut { found: true, length: acc.first, valid: acc.consistent && acc.parse_ok };
+}
+
+fn fold_cl(
+    acc: CLScan,
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    header: headers.Header,
+    live: bool
+) -> (result: CLScan) {
+    if !live {
+        return acc;
+    }
+    if !headers.name_is(buf, header.name_start, header.name_len, buflen, 0) {
+        return acc;
+    }
+    let digits: DigOut = parse_digits(buf, header.value_start, header.value_len, buflen);
+    if !digits.valid {
+        return CLScan { seen: true, first: acc.first, consistent: acc.consistent, parse_ok: false };
+    }
+    if !acc.seen {
+        return CLScan { seen: true, first: digits.value, consistent: true, parse_ok: acc.parse_ok };
+    }
+    return CLScan {
+        seen: true,
+        first: acc.first,
+        consistent: acc.consistent && acc.first == digits.value,
+        parse_ok: acc.parse_ok
+    };
+}

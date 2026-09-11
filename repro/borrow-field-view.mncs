@@ -1,0 +1,24 @@
+mncs 0.13;
+
+// Reproducer for WEB-P-002: an exact-array record field cannot borrow as
+// a bounded view, even though a direct named value of the same type can.
+// `via_direct` elaborates; `via_field` fails with MNE163.
+//
+// mncs-web workaround: rebind through a same-type local first
+// (`let staged_view: [byte; 1024] = grown.staged;`), see
+// src/web/parser.mncs (parser_feed, feed_flat, feed_pattern).
+module repro.borrow_field_view;
+
+record Wrap { data: [byte; 1024], len: u64 }
+
+fn take_view(buf: [byte; up_to 1024], len: u64) -> (result: u64) {
+    return buf.len;
+}
+
+fn via_direct(data: [byte; 1024], len: u64) -> (result: u64) {
+    return take_view(data, len);
+}
+
+fn via_field(wrap: Wrap) -> (result: u64) {
+    return take_view(wrap.data, wrap.len);
+}

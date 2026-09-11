@@ -1,0 +1,270 @@
+mncs 0.13;
+
+// web.headers — header block storage, name validation, and lookup.
+//
+// A `Header` is four offsets into the caller-held wire buffer; a
+// `HeaderBlock` holds up to 32 of them. Lookup is by small integer tag
+// (0 = content-length, 1 = host, 2 = content-type, 3 = connection,
+// 4 = transfer-encoding) so call sites never restate header spellings and
+// comparison stays case-insensitive per RFC 9110 §5.1.
+module web.headers.v1;
+
+use web.method as method;
+
+record Header { name_start: u64, name_len: u64, value_start: u64, value_len: u64 }
+
+record HeaderBlock { headers: [Header; 32], count: u64 }
+
+record PushOut { block: HeaderBlock, accepted: bool }
+
+record GetOut { found: bool, value_start: u64, value_len: u64 }
+
+fn blank_header() -> (result: Header) {
+    return Header { name_start: 0, name_len: 0, value_start: 0, value_len: 0 };
+}
+
+fn empty_block() -> (result: HeaderBlock) {
+    return HeaderBlock { headers: [blank_header(); 32], count: 0 };
+}
+
+fn make_header(name_start: u64, name_len: u64, value_start: u64, value_len: u64) -> (result: Header) {
+    return Header {
+        name_start: name_start,
+        name_len: name_len,
+        value_start: value_start,
+        value_len: value_len
+    };
+}
+
+fn block_push(block: HeaderBlock, header: Header) -> (result: PushOut) {
+    if block.count >= 32 {
+        return PushOut { block: block, accepted: false };
+    }
+    let grown: HeaderBlock = HeaderBlock {
+        headers: replace(block.headers, block.count, header),
+        count: block.count +% 1
+    };
+    return PushOut { block: grown, accepted: true };
+}
+
+fn byte_at(buf: [byte; up_to 1024], buflen: u64, idx: u64) -> (result: byte) {
+    if buf.len == 0 {
+        return 0;
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if idx < hlen {
+        return buf[idx];
+    }
+    return 0;
+}
+
+// Header field names are RFC 9110 tokens.
+fn name_valid(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64
+) -> (result: bool) {
+    if len == 0 {
+        return false;
+    }
+    if buf.len == 0 {
+        return false;
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if start >= hlen || start +% len > hlen {
+        return false;
+    }
+    iterate i over buf carrying ok: bool = true {
+        // hlen gate: keeps slot in-bounds for hostile `len` values whose
+        // upfront window check wrapped around.
+        let live: bool = i < len && start +% i < hlen;
+        let slot: u64 = select(live, start +% i, 0);
+        next ok = ok && select(live, method.is_token_char(buf[slot]), true);
+    }
+    return ok;
+}
+
+fn lower(value: byte) -> (result: byte) {
+    let n: i64 = value as i64;
+    if n >= 65 && n <= 90 {
+        return (n + 32) as byte;
+    }
+    return value;
+}
+
+fn byte_eq_folded(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    at: u64,
+    want: byte
+) -> (result: bool) {
+    return lower(byte_at(buf, buflen, at)) == want;
+}
+
+// content-length (14)
+fn is_content_length(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64
+) -> (result: bool) {
+    if len != 14 {
+        return false;
+    }
+    return byte_eq_folded(buf, buflen, start, 99)
+        && byte_eq_folded(buf, buflen, start +% 1, 111)
+        && byte_eq_folded(buf, buflen, start +% 2, 110)
+        && byte_eq_folded(buf, buflen, start +% 3, 116)
+        && byte_eq_folded(buf, buflen, start +% 4, 101)
+        && byte_eq_folded(buf, buflen, start +% 5, 110)
+        && byte_eq_folded(buf, buflen, start +% 6, 116)
+        && byte_eq_folded(buf, buflen, start +% 7, 45)
+        && byte_eq_folded(buf, buflen, start +% 8, 108)
+        && byte_eq_folded(buf, buflen, start +% 9, 101)
+        && byte_eq_folded(buf, buflen, start +% 10, 110)
+        && byte_eq_folded(buf, buflen, start +% 11, 103)
+        && byte_eq_folded(buf, buflen, start +% 12, 116)
+        && byte_eq_folded(buf, buflen, start +% 13, 104);
+}
+
+// host (4)
+fn is_host(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64
+) -> (result: bool) {
+    if len != 4 {
+        return false;
+    }
+    return byte_eq_folded(buf, buflen, start, 104)
+        && byte_eq_folded(buf, buflen, start +% 1, 111)
+        && byte_eq_folded(buf, buflen, start +% 2, 115)
+        && byte_eq_folded(buf, buflen, start +% 3, 116);
+}
+
+// connection (10)
+fn is_connection(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64
+) -> (result: bool) {
+    if len != 10 {
+        return false;
+    }
+    return byte_eq_folded(buf, buflen, start, 99)
+        && byte_eq_folded(buf, buflen, start +% 1, 111)
+        && byte_eq_folded(buf, buflen, start +% 2, 110)
+        && byte_eq_folded(buf, buflen, start +% 3, 110)
+        && byte_eq_folded(buf, buflen, start +% 4, 101)
+        && byte_eq_folded(buf, buflen, start +% 5, 99)
+        && byte_eq_folded(buf, buflen, start +% 6, 116)
+        && byte_eq_folded(buf, buflen, start +% 7, 105)
+        && byte_eq_folded(buf, buflen, start +% 8, 111)
+        && byte_eq_folded(buf, buflen, start +% 9, 110);
+}
+
+// content-type (12)
+fn is_content_type(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64
+) -> (result: bool) {
+    if len != 12 {
+        return false;
+    }
+    return byte_eq_folded(buf, buflen, start, 99)
+        && byte_eq_folded(buf, buflen, start +% 1, 111)
+        && byte_eq_folded(buf, buflen, start +% 2, 110)
+        && byte_eq_folded(buf, buflen, start +% 3, 116)
+        && byte_eq_folded(buf, buflen, start +% 4, 101)
+        && byte_eq_folded(buf, buflen, start +% 5, 110)
+        && byte_eq_folded(buf, buflen, start +% 6, 116)
+        && byte_eq_folded(buf, buflen, start +% 7, 45)
+        && byte_eq_folded(buf, buflen, start +% 8, 116)
+        && byte_eq_folded(buf, buflen, start +% 9, 121)
+        && byte_eq_folded(buf, buflen, start +% 10, 112)
+        && byte_eq_folded(buf, buflen, start +% 11, 101);
+}
+
+// transfer-encoding (17)
+fn is_transfer_encoding(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64
+) -> (result: bool) {
+    if len != 17 {
+        return false;
+    }
+    return byte_eq_folded(buf, buflen, start, 116)
+        && byte_eq_folded(buf, buflen, start +% 1, 114)
+        && byte_eq_folded(buf, buflen, start +% 2, 97)
+        && byte_eq_folded(buf, buflen, start +% 3, 110)
+        && byte_eq_folded(buf, buflen, start +% 4, 115)
+        && byte_eq_folded(buf, buflen, start +% 5, 102)
+        && byte_eq_folded(buf, buflen, start +% 6, 101)
+        && byte_eq_folded(buf, buflen, start +% 7, 114)
+        && byte_eq_folded(buf, buflen, start +% 8, 45)
+        && byte_eq_folded(buf, buflen, start +% 9, 101)
+        && byte_eq_folded(buf, buflen, start +% 10, 110)
+        && byte_eq_folded(buf, buflen, start +% 11, 99)
+        && byte_eq_folded(buf, buflen, start +% 12, 111)
+        && byte_eq_folded(buf, buflen, start +% 13, 100)
+        && byte_eq_folded(buf, buflen, start +% 14, 105)
+        && byte_eq_folded(buf, buflen, start +% 15, 110)
+        && byte_eq_folded(buf, buflen, start +% 16, 103);
+}
+
+fn name_is(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64,
+    tag: u64
+) -> (result: bool) {
+    if tag == 0 {
+        return is_content_length(buf, start, len, buflen);
+    }
+    if tag == 1 {
+        return is_host(buf, start, len, buflen);
+    }
+    if tag == 2 {
+        return is_content_type(buf, start, len, buflen);
+    }
+    if tag == 3 {
+        return is_connection(buf, start, len, buflen);
+    }
+    if tag == 4 {
+        return is_transfer_encoding(buf, start, len, buflen);
+    }
+    return false;
+}
+
+// First match wins. Only headers below `count` participate; blank slots
+// past the count are never inspected.
+fn header_get(
+    block: HeaderBlock,
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    tag: u64
+) -> (result: GetOut) {
+    iterate i over block.headers carrying acc: GetOut = GetOut { found: false, value_start: 0, value_len: 0 } {
+        let live: bool = i < block.count && !acc.found;
+        let slot: u64 = select(live, i, 0);
+        let header: Header = block.headers[slot];
+        let hit: bool = name_is(buf, header.name_start, header.name_len, buflen, tag);
+        next acc = select_get(acc, live, hit, header);
+    }
+    return acc;
+}
+
+fn select_get(acc: GetOut, live: bool, hit: bool, header: Header) -> (result: GetOut) {
+    if live && hit {
+        return GetOut { found: true, value_start: header.value_start, value_len: header.value_len };
+    }
+    return acc;
+}

@@ -1,0 +1,969 @@
+mncs 0.13;
+
+// web.parser — incremental HTTP/1.x head parser as an explicit state machine.
+//
+// Design (see ARCHITECTURE.md "parser decomposition"):
+// - One linear scan over the caller-held wire buffer. The carried `Scan`
+//   value holds the machine phase plus every span offset; the buffer
+//   itself is never copied.
+// - `ParseOut.kind` is 0 (complete), 1 (incomplete: feed more bytes), or
+//   2 (error: `error` carries the web.error code). End-of-buffer before a
+//   terminal state is Incomplete, never a guess: a positively wrong byte
+//   is the only thing that fails.
+// - Strict CRLF framing: bare CR and bare LF are BadHeader/BadStartLine.
+//   Rationale: at a security boundary, leniency is a smuggling vector.
+// - Bodies are spans, not copies. With Content-Length present the parser
+//   requires head_len + length bytes before completing; without it the
+//   body is empty (connection-close framing is out of scope in v1).
+// - `Parser` retains staged bytes across `parser_feed` calls for genuinely
+//   incremental hosts; `feed_flat` offers the same verdicts through a flat
+//   corpus-friendly boundary (staged buffer threaded by the caller).
+module web.parser.v1;
+
+use web.error as error;
+use web.headers as headers;
+use web.limits as limits;
+use web.message as message;
+use web.method as method;
+use web.uri as uri;
+use web.version as version;
+
+enum Phase {
+    Method,
+    Target,
+    Version,
+    HeaderName,
+    HeaderValue,
+    AfterCR,
+    Body,
+    Done,
+    Failed
+}
+
+record Scan {
+    phase: Phase,
+    mode: u64,
+    cr_from: u64,
+    token_start: u64,
+    line_start: u64,
+    method: u64,
+    ext_start: u64,
+    ext_len: u64,
+    target_start: u64,
+    target_len: u64,
+    version: u64,
+    status: u16,
+    reason_start: u64,
+    reason_len: u64,
+    name_start: u64,
+    name_len: u64,
+    value_start: u64,
+    value_end: u64,
+    value_seen: bool,
+    block: headers.HeaderBlock,
+    cl_found: bool,
+    cl_value: u64,
+    body_start: u64,
+    body_need: u64,
+    body_have: u64,
+    body_len: u64,
+    head_len: u64,
+    error: error.Error
+}
+
+record ParseOut {
+    kind: u64,
+    error: u64,
+    consumed: u64,
+    is_response: bool,
+    head: message.RequestHead,
+    response: message.ResponseHead
+}
+
+record Parser {
+    staged: [byte; 1024],
+    staged_len: u64,
+    out: ParseOut,
+    settled: bool
+}
+
+record FeedOut { parser: Parser, out: ParseOut }
+
+record FeedState {
+    staged: [byte; 1024],
+    staged_len: u64,
+    kind: u64,
+    error: u64,
+    consumed: u64,
+    head: message.RequestHead
+}
+
+fn scan_init(mode: u64) -> (result: Scan) {
+    return Scan {
+        phase: Phase.Method,
+        mode: mode,
+        cr_from: 0,
+        token_start: 0,
+        line_start: 0,
+        method: 9,
+        ext_start: 0,
+        ext_len: 0,
+        target_start: 0,
+        target_len: 0,
+        version: 1,
+        status: 0,
+        reason_start: 0,
+        reason_len: 0,
+        name_start: 0,
+        name_len: 0,
+        value_start: 0,
+        value_end: 0,
+        value_seen: false,
+        block: headers.empty_block(),
+        cl_found: false,
+        cl_value: 0,
+        body_start: 0,
+        body_need: 0,
+        body_have: 0,
+        body_len: 0,
+        head_len: 0,
+        error: error.none()
+    };
+}
+
+fn mark_failed(scan: Scan, kind: error.Error) -> (result: Scan) {
+    return Scan { ..scan, phase: Phase.Failed, error: kind };
+}
+
+fn incomplete_out() -> (result: ParseOut) {
+    return ParseOut {
+        kind: 1,
+        error: 0,
+        consumed: 0,
+        is_response: false,
+        head: message.empty_request(),
+        response: message.empty_response()
+    };
+}
+
+fn error_out(code: u64) -> (result: ParseOut) {
+    return ParseOut {
+        kind: 2,
+        error: code,
+        consumed: 0,
+        is_response: false,
+        head: message.empty_request(),
+        response: message.empty_response()
+    };
+}
+
+fn byte_at(buf: [byte; up_to 1024], hlen: u64, idx: u64) -> (result: byte) {
+    if buf.len == 0 {
+        return 0;
+    }
+    if idx < hlen {
+        return buf[idx];
+    }
+    return 0;
+}
+
+fn is_ctl(value: byte) -> (result: bool) {
+    let n: i64 = value as i64;
+    if n < 32 {
+        return true;
+    }
+    return n == 127;
+}
+
+// ---- per-phase step functions: each is total over (scan, byte, index).
+
+fn step_method(
+    scan: Scan,
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    lims: limits.Limits,
+    i: u64,
+    byte: byte
+) -> (result: Scan) {
+    if i -% scan.line_start +% 1 > lims.max_start_line {
+        return mark_failed(scan, error.too_long_start_line());
+    }
+    if scan.mode == 1 {
+        return step_method_response(scan, buf, hlen, i, byte);
+    }
+    if byte == 32 {
+        let len: u64 = i -% scan.token_start;
+        if len == 0 {
+            return mark_failed(scan, error.bad_start_line());
+        }
+        if !method.token_valid(buf, scan.token_start, len, hlen) {
+            return mark_failed(scan, error.bad_method());
+        }
+        let parsed: method.Method = method.parse(buf, scan.token_start, len, hlen);
+        let code: u64 = method.code_of(parsed);
+        if code == 9 {
+            return Scan {
+                ..scan,
+                phase: Phase.Target,
+                method: 9,
+                ext_start: scan.token_start,
+                ext_len: len,
+                token_start: i +% 1
+            };
+        }
+        return Scan {
+            ..scan,
+            phase: Phase.Target,
+            method: code,
+            token_start: i +% 1
+        };
+    }
+    if byte == 13 || byte == 10 {
+        return mark_failed(scan, error.bad_start_line());
+    }
+    if is_ctl(byte) {
+        return mark_failed(scan, error.bad_method());
+    }
+    return scan;
+}
+
+// Response start line opens with the version token, not a method.
+fn step_method_response(
+    scan: Scan,
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    i: u64,
+    byte: byte
+) -> (result: Scan) {
+    if byte == 32 {
+        let len: u64 = i -% scan.token_start;
+        let v: u64 = version.parse(buf, scan.token_start, len, hlen);
+        if v == 2 {
+            return mark_failed(scan, error.bad_version());
+        }
+        return Scan { ..scan, phase: Phase.Target, version: v, token_start: i +% 1 };
+    }
+    if byte == 13 || byte == 10 {
+        return mark_failed(scan, error.bad_status());
+    }
+    if is_ctl(byte) {
+        return mark_failed(scan, error.bad_version());
+    }
+    return scan;
+}
+
+fn step_target(
+    scan: Scan,
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    lims: limits.Limits,
+    i: u64,
+    byte: byte
+) -> (result: Scan) {
+    if i -% scan.line_start +% 1 > lims.max_start_line {
+        return mark_failed(scan, error.too_long_start_line());
+    }
+    if scan.mode == 1 {
+        return step_code(scan, buf, hlen, i, byte);
+    }
+    if byte == 32 {
+        let len: u64 = i -% scan.token_start;
+        if len == 0 {
+            return mark_failed(scan, error.bad_start_line());
+        }
+        return Scan {
+            ..scan,
+            phase: Phase.Version,
+            target_start: scan.token_start,
+            target_len: len,
+            token_start: i +% 1
+        };
+    }
+    if byte == 13 || byte == 10 {
+        return mark_failed(scan, error.bad_start_line());
+    }
+    return scan;
+}
+
+fn step_version(
+    scan: Scan,
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    lims: limits.Limits,
+    i: u64,
+    byte: byte
+) -> (result: Scan) {
+    if i -% scan.line_start +% 1 > lims.max_start_line {
+        return mark_failed(scan, error.too_long_start_line());
+    }
+    if scan.mode == 1 {
+        return step_reason(scan, i, byte);
+    }
+    if byte == 13 {
+        let len: u64 = i -% scan.token_start;
+        let v: u64 = version.parse(buf, scan.token_start, len, hlen);
+        if v == 2 {
+            return mark_failed(scan, error.bad_version());
+        }
+        return Scan { ..scan, phase: Phase.AfterCR, cr_from: 0, version: v };
+    }
+    if byte == 10 {
+        return mark_failed(scan, error.bad_start_line());
+    }
+    if byte == 32 {
+        return mark_failed(scan, error.bad_version());
+    }
+    if is_ctl(byte) {
+        return mark_failed(scan, error.bad_version());
+    }
+    return scan;
+}
+
+// Response reason phrase: visible bytes, SP, and HTAB until CR. Every
+// byte is validated on arrival, so the span is known-clean at CR time.
+fn step_reason(scan: Scan, i: u64, byte: byte) -> (result: Scan) {
+    if byte == 13 {
+        let len: u64 = i -% scan.token_start;
+        if len > 128 {
+            return mark_failed(scan, error.bad_status());
+        }
+        return Scan {
+            ..scan,
+            phase: Phase.AfterCR,
+            cr_from: 0,
+            reason_start: scan.token_start,
+            reason_len: len
+        };
+    }
+    if byte == 10 {
+        return mark_failed(scan, error.bad_status());
+    }
+    let n: i64 = byte as i64;
+    if n == 127 {
+        return mark_failed(scan, error.bad_status());
+    }
+    if n < 32 && n != 9 {
+        return mark_failed(scan, error.bad_status());
+    }
+    if i -% scan.token_start +% 1 > 128 {
+        return mark_failed(scan, error.bad_status());
+    }
+    return scan;
+}
+
+fn step_header_name(
+    scan: Scan,
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    lims: limits.Limits,
+    i: u64,
+    byte: byte
+) -> (result: Scan) {
+    if i -% scan.line_start +% 1 > lims.max_header_line {
+        return mark_failed(scan, error.too_long_header());
+    }
+    if byte == 13 {
+        if i == scan.line_start {
+            return Scan { ..scan, phase: Phase.AfterCR, cr_from: 2 };
+        }
+        return mark_failed(scan, error.bad_separator());
+    }
+    if byte == 10 {
+        return mark_failed(scan, error.bad_header());
+    }
+    if byte == 58 {
+        let len: u64 = i -% scan.line_start;
+        if len == 0 {
+            return mark_failed(scan, error.bad_name());
+        }
+        if !headers.name_valid(buf, scan.line_start, len, hlen) {
+            return mark_failed(scan, error.bad_name());
+        }
+        return Scan {
+            ..scan,
+            phase: Phase.HeaderValue,
+            name_start: scan.line_start,
+            name_len: len,
+            value_start: i +% 1,
+            value_end: i +% 1,
+            value_seen: false
+        };
+    }
+    if byte == 32 || byte == 9 {
+        if i == scan.line_start {
+            return mark_failed(scan, error.bad_header());
+        }
+        return mark_failed(scan, error.bad_name());
+    }
+    if is_ctl(byte) {
+        return mark_failed(scan, error.bad_name());
+    }
+    return scan;
+}
+
+fn step_header_value(
+    scan: Scan,
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    lims: limits.Limits,
+    i: u64,
+    byte: byte
+) -> (result: Scan) {
+    if i -% scan.line_start +% 1 > lims.max_header_line {
+        return mark_failed(scan, error.too_long_header());
+    }
+    if byte == 13 {
+        let vs: u64 = select(scan.value_seen, scan.value_start, i);
+        let ve: u64 = select(scan.value_seen, scan.value_end, i);
+        let vl: u64 = ve -% vs;
+        if scan.block.count >= lims.max_headers {
+            return mark_failed(scan, error.too_many_headers());
+        }
+        let pushed: headers.PushOut = headers.block_push(
+            scan.block,
+            headers.make_header(scan.name_start, scan.name_len, vs, vl)
+        );
+        if !pushed.accepted {
+            return mark_failed(scan, error.too_many_headers());
+        }
+        return Scan { ..scan, phase: Phase.AfterCR, cr_from: 1, block: pushed.block };
+    }
+    if byte == 10 {
+        return mark_failed(scan, error.bad_header());
+    }
+    if byte == 32 || byte == 9 {
+        return scan;
+    }
+    if is_ctl(byte) {
+        return mark_failed(scan, error.bad_header());
+    }
+    return Scan {
+        ..scan,
+        value_start: select(scan.value_seen, scan.value_start, i),
+        value_end: i +% 1,
+        value_seen: true
+    };
+}
+
+fn step_after_cr(
+    scan: Scan,
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    lims: limits.Limits,
+    i: u64,
+    byte: byte
+) -> (result: Scan) {
+    if byte != 10 {
+        return mark_failed(scan, error.bad_header());
+    }
+    if scan.cr_from == 2 {
+        return empty_line(scan, buf, hlen, lims, i);
+    }
+    if i +% 1 > lims.max_head_bytes {
+        return mark_failed(scan, error.head_too_large());
+    }
+    return Scan { ..scan, phase: Phase.HeaderName, line_start: i +% 1 };
+}
+
+fn empty_line(
+    scan: Scan,
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    lims: limits.Limits,
+    i: u64
+) -> (result: Scan) {
+    let head_len: u64 = i +% 1;
+    if head_len > lims.max_head_bytes {
+        return mark_failed(scan, error.head_too_large());
+    }
+    let cl: message.CLOut = message.content_length_of(scan.block, buf, hlen);
+    if cl.found && !cl.valid {
+        return mark_failed(scan, error.bad_content_length());
+    }
+    // v1 implements no transfer codings: any present non-empty
+    // Transfer-Encoding framing is refused (501) rather than silently
+    // processed as identity framing, which would be a smuggling vector.
+    let te: headers.GetOut = headers.header_get(scan.block, buf, hlen, 4);
+    if te.found && te.value_len > 0 {
+        return mark_failed(scan, error.unsupported_transfer());
+    }
+    let need: u64 = select(cl.found, cl.length, 0);
+    if need > lims.max_body_bytes {
+        return mark_failed(scan, error.body_too_large());
+    }
+    let have: u64 = hlen -% head_len;
+    if have >= need {
+        return Scan {
+            ..scan,
+            phase: Phase.Done,
+            cl_found: cl.found,
+            cl_value: need,
+            body_start: head_len,
+            body_len: need,
+            head_len: head_len
+        };
+    }
+    // NOTE: body_have starts at 0 and counts only the post-empty-line
+    // bytes of THIS scan. Initializing it to `have` double-counts the
+    // staged body bytes (they are re-scanned below) and completes short
+    // bodies early — a real framing bug caught by test_prefixes_are_incomplete.
+    return Scan {
+        ..scan,
+        phase: Phase.Body,
+        cl_found: cl.found,
+        cl_value: need,
+        body_start: head_len,
+        body_need: need,
+        body_have: 0,
+        head_len: head_len
+    };
+}
+
+fn step_body(scan: Scan) -> (result: Scan) {
+    let have: u64 = scan.body_have +% 1;
+    if have >= scan.body_need {
+        return Scan { ..scan, phase: Phase.Done, body_have: have, body_len: scan.body_need };
+    }
+    return Scan { ..scan, body_have: have };
+}
+
+// ---- dispatch, driver, finalizer, and caller boundaries.
+
+fn step(
+    scan: Scan,
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    lims: limits.Limits,
+    i: u64,
+    live: bool
+) -> (result: Scan) {
+    if !live {
+        return scan;
+    }
+    let byte: byte = byte_at(buf, hlen, i);
+    return match scan.phase {
+        Method => step_method(scan, buf, hlen, lims, i, byte),
+        Target => step_target(scan, buf, hlen, lims, i, byte),
+        Version => step_version(scan, buf, hlen, lims, i, byte),
+        HeaderName => step_header_name(scan, buf, hlen, lims, i, byte),
+        HeaderValue => step_header_value(scan, buf, hlen, lims, i, byte),
+        AfterCR => step_after_cr(scan, buf, hlen, lims, i, byte),
+        Body => step_body(scan),
+        Done => scan,
+        Failed => scan,
+    };
+}
+
+fn scan_head(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    mode: u64,
+    lims: limits.Limits
+) -> (result: Scan) {
+    if buf.len == 0 {
+        return scan_init(mode);
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    iterate i over buf carrying scan: Scan = scan_init(mode) {
+        next scan = step(scan, buf, hlen, lims, i, i < hlen);
+    }
+    return scan;
+}
+
+fn finish(scan: Scan, buf: [byte; up_to 1024], hlen: u64, mode: u64) -> (result: ParseOut) {
+    return match scan.phase {
+        Failed => ParseOut {
+            kind: 2,
+            error: error.code_of(scan.error),
+            consumed: 0,
+            is_response: mode == 1,
+            head: message.empty_request(),
+            response: message.empty_response()
+        },
+        Done => finish_done(scan, buf, hlen, mode),
+        Method => mark_incomplete(mode),
+        Target => mark_incomplete(mode),
+        Version => mark_incomplete(mode),
+        HeaderName => mark_incomplete(mode),
+        HeaderValue => mark_incomplete(mode),
+        AfterCR => mark_incomplete(mode),
+        Body => mark_incomplete(mode),
+    };
+}
+
+fn mark_incomplete(mode: u64) -> (result: ParseOut) {
+    let base: ParseOut = incomplete_out();
+    return ParseOut { ..base, is_response: mode == 1 };
+}
+
+fn finish_done(scan: Scan, buf: [byte; up_to 1024], hlen: u64, mode: u64) -> (result: ParseOut) {
+    let consumed: u64 = scan.head_len +% scan.body_len;
+    if mode == 1 {
+        return ParseOut {
+            kind: 0,
+            error: 0,
+            consumed: consumed,
+            is_response: true,
+            head: message.empty_request(),
+            response: message.make_response(
+                scan.version,
+                scan.status,
+                scan.reason_start,
+                scan.reason_len,
+                scan.block,
+                scan.body_start,
+                scan.body_len
+            )
+        };
+    }
+    let target: uri.TargetOut = uri.split_target(buf, scan.target_start, scan.target_len, hlen);
+    if target.valid != 0 {
+        return ParseOut {
+            kind: 2,
+            error: 2,
+            consumed: 0,
+            is_response: false,
+            head: message.empty_request(),
+            response: message.empty_response()
+        };
+    }
+    return ParseOut {
+        kind: 0,
+        error: 0,
+        consumed: consumed,
+        is_response: false,
+        head: message.make_request(
+            scan.method,
+            scan.ext_start,
+            scan.ext_len,
+            target.uri,
+            scan.version,
+            scan.block,
+            scan.cl_value,
+            scan.cl_found,
+            scan.body_start,
+            scan.body_len,
+            scan.head_len
+        ),
+        response: message.empty_response()
+    };
+}
+
+// Response status code: exactly three ASCII digits forming 100..=599.
+fn step_code(
+    scan: Scan,
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    i: u64,
+    byte: byte
+) -> (result: Scan) {
+    // The code may be terminated by SP (reason follows) or directly by
+    // CR (empty reason phrase, legal per RFC 9110). A bare LF is refused.
+    if byte == 32 || byte == 13 {
+        let len: u64 = i -% scan.token_start;
+        let digits: message.DigOut = message.parse_digits(buf, scan.token_start, len, hlen);
+        if !digits.valid || len != 3 {
+            return mark_failed(scan, error.bad_status());
+        }
+        if digits.value < 100 || digits.value > 599 {
+            return mark_failed(scan, error.bad_status());
+        }
+        let code: u16 = (digits.value % 65536) as u16;
+        if byte == 32 {
+            return Scan {
+                ..scan,
+                phase: Phase.Version,
+                status: code,
+                token_start: i +% 1
+            };
+        }
+        return Scan {
+            ..scan,
+            phase: Phase.AfterCR,
+            cr_from: 0,
+            status: code,
+            reason_start: i,
+            reason_len: 0
+        };
+    }
+    if byte == 10 {
+        return mark_failed(scan, error.bad_status());
+    }
+    return scan;
+}
+
+// ---- flat caller boundaries (scalars + byte views only).
+
+fn run_parse(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    mode: u64,
+    lims: limits.Limits
+) -> (result: ParseOut) {
+    if buf.len == 0 {
+        return mark_incomplete(mode);
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    let scan: Scan = scan_head(buf, hlen, mode, lims);
+    return finish(scan, buf, hlen, mode);
+}
+
+fn parse_request(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    max_start_line: u64,
+    max_header_line: u64,
+    max_headers: u64,
+    max_head_bytes: u64,
+    max_body_bytes: u64
+) -> (result: ParseOut) {
+    let lims: limits.Limits = limits.limits_make(
+        max_start_line,
+        max_header_line,
+        max_headers,
+        max_head_bytes,
+        max_body_bytes
+    );
+    return run_parse(buf, buflen, 0, lims);
+}
+
+fn parse_response(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    max_start_line: u64,
+    max_header_line: u64,
+    max_headers: u64,
+    max_head_bytes: u64,
+    max_body_bytes: u64
+) -> (result: ParseOut) {
+    let lims: limits.Limits = limits.limits_make(
+        max_start_line,
+        max_header_line,
+        max_headers,
+        max_head_bytes,
+        max_body_bytes
+    );
+    return run_parse(buf, buflen, 1, lims);
+}
+
+fn parse_default(buf: [byte; up_to 1024], buflen: u64) -> (result: ParseOut) {
+    return run_parse(buf, buflen, 0, limits.default_limits());
+}
+
+// ---- incremental staging: the caller retains bytes, the Parser retains
+// nothing but staged copies and the settled verdict (value semantics: no
+// borrows cross a feed boundary).
+
+fn parser_new() -> (result: Parser) {
+    return Parser {
+        staged: [0; 1024],
+        staged_len: 0,
+        out: incomplete_out(),
+        settled: false
+    };
+}
+
+record StageAcc { staged: [byte; 1024], len: u64 }
+
+fn stage_append(
+    staged: [byte; 1024],
+    staged_len: u64,
+    chunk: [byte; up_to 256],
+    n: u64
+) -> (result: StageAcc) {
+    if n == 0 {
+        return StageAcc { staged: staged, len: staged_len };
+    }
+    if chunk.len == 0 {
+        return StageAcc { staged: staged, len: staged_len };
+    }
+    let take: u64 = select(n <= chunk.len, n, chunk.len);
+    // Caller guarantees staged_len +% take <= 1024, so every live slot
+    // below is in bounds; slot 0 (valid: staged has 1024 slots) covers
+    // the dead iterations that strict `select` still evaluates.
+    iterate j over chunk carrying acc: [byte; 1024] = staged {
+        let live: bool = j < take;
+        let slot: u64 = select(live, staged_len +% j, 0);
+        next acc = select(live, replace(acc, slot, chunk[j]), acc);
+    }
+    return StageAcc { staged: acc, len: staged_len +% take };
+}
+
+fn clamp_take(chunk_len: u64, have: u64) -> (result: u64) {
+    let bounded: u64 = select(chunk_len <= 256, chunk_len, 256);
+    return select(bounded <= have, bounded, have);
+}
+
+fn parser_feed(
+    parser: Parser,
+    chunk: [byte; up_to 256],
+    chunk_len: u64,
+    max_start_line: u64,
+    max_header_line: u64,
+    max_headers: u64,
+    max_head_bytes: u64,
+    max_body_bytes: u64
+) -> (result: FeedOut) {
+    if parser.settled {
+        return FeedOut { parser: parser, out: parser.out };
+    }
+    let lims: limits.Limits = limits.limits_make(
+        max_start_line,
+        max_header_line,
+        max_headers,
+        max_head_bytes,
+        max_body_bytes
+    );
+    let take: u64 = clamp_take(chunk_len, chunk.len);
+    if parser.staged_len +% take > 1024 {
+        let settled: Parser = Parser {
+            staged: parser.staged,
+            staged_len: parser.staged_len,
+            out: error_out(12),
+            settled: true
+        };
+        return FeedOut { parser: settled, out: settled.out };
+    }
+    let grown: StageAcc = stage_append(parser.staged, parser.staged_len, chunk, take);
+    // Borrow-through-projection workaround (see pressure WEB-P-002): a
+    // record field of exact array type cannot borrow as a view directly,
+    // so rebind through a same-type local first.
+    let staged_view: [byte; 1024] = grown.staged;
+    let out: ParseOut = run_parse(staged_view, grown.len, 0, lims);
+    let done: bool = !(out.kind == 1);
+    let advanced: Parser = Parser {
+        staged: grown.staged,
+        staged_len: grown.len,
+        out: out,
+        settled: done
+    };
+    return FeedOut { parser: advanced, out: out };
+}
+
+// Multi-step staging driver: stages the whole buffer in `chunk_size`
+// pieces through `stage_append`, then scans once. Returns the final
+// state only (prefix batteries prove the intermediate verdicts). This
+// is the 1-byte-fragmentation test path: chunk_size 1 feeds every byte
+// through the same code the incremental Parser uses.
+fn feed_pattern(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    chunk_size: u64,
+    max_start_line: u64,
+    max_header_line: u64,
+    max_headers: u64,
+    max_head_bytes: u64,
+    max_body_bytes: u64
+) -> (result: FeedState) {
+    let lims: limits.Limits = limits.limits_make(
+        max_start_line,
+        max_header_line,
+        max_headers,
+        max_head_bytes,
+        max_body_bytes
+    );
+    if buf.len == 0 {
+        return FeedState {
+            staged: [0; 1024],
+            staged_len: 0,
+            kind: 1,
+            error: 0,
+            consumed: 0,
+            head: message.empty_request()
+        };
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    let cs: u64 = clamp_chunk(chunk_size);
+    iterate f over buf carrying acc: PatAcc = PatAcc { staged: [0; 1024], len: 0 } {
+        next acc = fold_feed(acc, buf, hlen, f, cs);
+    }
+    let view: [byte; 1024] = acc.staged;
+    let out: ParseOut = run_parse(view, acc.len, 0, lims);
+    return FeedState {
+        staged: acc.staged,
+        staged_len: acc.len,
+        kind: out.kind,
+        error: out.error,
+        consumed: out.consumed,
+        head: out.head
+    };
+}
+
+record PatAcc { staged: [byte; 1024], len: u64 }
+
+fn clamp_chunk(chunk_size: u64) -> (result: u64) {
+    let bounded: u64 = select(chunk_size <= 256, chunk_size, 256);
+    return select(bounded >= 1, bounded, 1);
+}
+
+fn fold_feed(acc: PatAcc, buf: [byte; up_to 1024], hlen: u64, f: u64, cs: u64) -> (result: PatAcc) {
+    let cstart: u64 = f *% cs;
+    if cstart >= hlen {
+        return acc;
+    }
+    let room: u64 = hlen -% cstart;
+    let n: u64 = select(cs <= room, cs, room);
+    let chunk: [byte; 256] = build_chunk(buf, hlen, cstart, n);
+    let grown: StageAcc = stage_append(acc.staged, acc.len, chunk, n);
+    return PatAcc { staged: grown.staged, len: grown.len };
+}
+
+fn build_chunk(
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    cstart: u64,
+    n: u64
+) -> (result: [byte; 256]) {
+    let carrier: [byte; 256] = [0; 256];
+    iterate j over carrier carrying acc: [byte; 256] = carrier {
+        let live: bool = j < n;
+        let slot: u64 = select(live && cstart +% j < hlen, cstart +% j, 0);
+        next acc = replace(acc, j, select(live, buf[slot], 0));
+    }
+    return acc;
+}
+
+// Flat equivalent of parser_feed for corpus drivers that thread the
+// staged buffer themselves: identical verdicts, no record arguments.
+fn feed_flat(
+    staged: [byte; 1024],
+    staged_len: u64,
+    chunk: [byte; up_to 256],
+    chunk_len: u64,
+    max_start_line: u64,
+    max_header_line: u64,
+    max_headers: u64,
+    max_head_bytes: u64,
+    max_body_bytes: u64
+) -> (result: FeedState) {
+    let lims: limits.Limits = limits.limits_make(
+        max_start_line,
+        max_header_line,
+        max_headers,
+        max_head_bytes,
+        max_body_bytes
+    );
+    let take: u64 = clamp_take(chunk_len, chunk.len);
+    if staged_len +% take > 1024 {
+        return FeedState {
+            staged: staged,
+            staged_len: staged_len,
+            kind: 2,
+            error: 12,
+            consumed: 0,
+            head: message.empty_request()
+        };
+    }
+    let grown: StageAcc = stage_append(staged, staged_len, chunk, take);
+    // Same borrow-through-projection workaround as parser_feed.
+    let flat_view: [byte; 1024] = grown.staged;
+    let out: ParseOut = run_parse(flat_view, grown.len, 0, lims);
+    return FeedState {
+        staged: grown.staged,
+        staged_len: grown.len,
+        kind: out.kind,
+        error: out.error,
+        consumed: out.consumed,
+        head: out.head
+    };
+}

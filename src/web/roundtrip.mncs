@@ -1,0 +1,187 @@
+mncs 0.13;
+
+// web.roundtrip — executable round-trip laws for the codec pair.
+//
+// `request_roundtrip` parses, re-encodes, re-parses, and compares the two
+// models for semantic equality (span CONTENT, not byte identity: header
+// order and reason bytes are preserved by this codec, but the law only
+// promises model equivalence). `response_roundtrip` does the same from
+// the encoder side. A return of 0 means the law holds; any other code
+// names the first divergence. These run on every backend as corpus
+// cases, so the codec pair is verified identically everywhere.
+module web.roundtrip.v1;
+
+use web.encode as encode;
+use web.headers as headers;
+use web.message as message;
+use web.parser as parser;
+
+fn span_eq(
+    a: [byte; up_to 1024],
+    alen: u64,
+    astart: u64,
+    an: u64,
+    b: [byte; up_to 1024],
+    blen: u64,
+    bstart: u64,
+    bn: u64
+) -> (result: bool) {
+    if !(an == bn) {
+        return false;
+    }
+    if a.len == 0 || b.len == 0 {
+        return an == 0;
+    }
+    let ahlen: u64 = select(alen <= a.len, alen, a.len);
+    let bhlen: u64 = select(blen <= b.len, blen, b.len);
+    iterate i over a carrying ok: bool = true {
+        let live: bool = i < an;
+        let aslot: u64 = select(live && astart +% i < ahlen, astart +% i, 0);
+        let bslot: u64 = select(live && bstart +% i < bhlen, bstart +% i, 0);
+        next ok = ok && select(live, a[aslot] == b[bslot], true);
+    }
+    return ok;
+}
+
+fn headers_eq(
+    ablock: headers.HeaderBlock,
+    a: [byte; up_to 1024],
+    alen: u64,
+    bblock: headers.HeaderBlock,
+    b: [byte; up_to 1024],
+    blen: u64
+) -> (result: u64) {
+    if !(ablock.count == bblock.count) {
+        return 10;
+    }
+    iterate i over ablock.headers carrying code: u64 = 0 {
+        let live: bool = i < ablock.count && code == 0;
+        let slot: u64 = select(live, i, 0);
+        let ha: headers.Header = ablock.headers[slot];
+        let hb: headers.Header = bblock.headers[slot];
+        next code = compare_header(code, ha, hb, a, alen, b, blen, live);
+    }
+    return code;
+}
+
+fn compare_header(
+    code: u64,
+    ha: headers.Header,
+    hb: headers.Header,
+    a: [byte; up_to 1024],
+    alen: u64,
+    b: [byte; up_to 1024],
+    blen: u64,
+    live: bool
+) -> (result: u64) {
+    if !live {
+        return code;
+    }
+    if !(code == 0) {
+        return code;
+    }
+    if !span_eq(a, alen, ha.name_start, ha.name_len, b, blen, hb.name_start, hb.name_len) {
+        return 11;
+    }
+    if !span_eq(a, alen, ha.value_start, ha.value_len, b, blen, hb.value_start, hb.value_len) {
+        return 12;
+    }
+    return 0;
+}
+
+fn heads_eq(
+    first: message.RequestHead,
+    a: [byte; up_to 1024],
+    alen: u64,
+    second: message.RequestHead,
+    b: [byte; up_to 1024],
+    blen: u64
+) -> (result: u64) {
+    if !(first.method == second.method) {
+        return 1;
+    }
+    if first.method == 9 {
+        if !span_eq(a, alen, first.ext_start, first.ext_len, b, blen, second.ext_start, second.ext_len) {
+            return 2;
+        }
+    }
+    if !span_eq(a, alen, first.target.path_start, first.target.path_len, b, blen, second.target.path_start, second.target.path_len) {
+        return 3;
+    }
+    if first.target.has_query != second.target.has_query {
+        return 4;
+    }
+    if first.target.has_query {
+        if !span_eq(a, alen, first.target.query_start, first.target.query_len, b, blen, second.target.query_start, second.target.query_len) {
+            return 5;
+        }
+    }
+    if !(first.version == second.version) {
+        return 6;
+    }
+    let hcode: u64 = headers_eq(first.headers, a, alen, second.headers, b, blen);
+    if !(hcode == 0) {
+        return hcode;
+    }
+    if first.has_content_length != second.has_content_length {
+        return 13;
+    }
+    if !(first.content_length == second.content_length) {
+        return 14;
+    }
+    if !span_eq(a, alen, first.body_start, first.body_len, b, blen, second.body_start, second.body_len) {
+        return 15;
+    }
+    return 0;
+}
+
+fn request_roundtrip(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    max_start_line: u64,
+    max_header_line: u64,
+    max_headers: u64,
+    max_head_bytes: u64,
+    max_body_bytes: u64
+) -> (result: u64) {
+    let first: parser.ParseOut = parser.parse_request(
+        buf, buflen, max_start_line, max_header_line, max_headers, max_head_bytes, max_body_bytes
+    );
+    if !(first.kind == 0) {
+        return (first.kind *% 10) +% first.error +% 1000;
+    }
+    let enc: encode.EncodeOut = encode.encode_request(buf, buflen, first.head);
+    if enc.truncated {
+        return 5001;
+    }
+    let wire: [byte; 1024] = enc.data;
+    let second: parser.ParseOut = parser.parse_request(
+        wire, enc.length, max_start_line, max_header_line, max_headers, max_head_bytes, max_body_bytes
+    );
+    if !(second.kind == 0) {
+        return (second.kind *% 10) +% second.error +% 3000;
+    }
+    return heads_eq(first.head, buf, buflen, second.head, wire, enc.length);
+}
+
+fn response_roundtrip(code: u16, content_type: u64, body: [byte; 256], body_len: u64) -> (result: u64) {
+    let enc: encode.EncodeOut = encode.respond(code, content_type, body, body_len);
+    if enc.truncated {
+        return 4001;
+    }
+    let wire: [byte; 1024] = enc.data;
+    let parsed: parser.ParseOut = parser.parse_response(
+        wire, enc.length, 512, 512, 32, 1024, 1024
+    );
+    if !(parsed.kind == 0) {
+        return (parsed.kind *% 10) +% parsed.error +% 3000;
+    }
+    if !((parsed.response.status as u64) == (code as u64)) {
+        return 1;
+    }
+    let bv: [byte; 256] = body;
+    if !span_eq(bv, body_len, 0, body_len, wire, enc.length, parsed.response.body_start, parsed.response.body_len) {
+        return 2;
+    }
+    return 0;
+}

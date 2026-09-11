@@ -1,0 +1,223 @@
+mncs 0.13;
+
+// web.query — application/x-www-form-urlencoded query inspection.
+//
+// Query pairs are spans into the caller buffer; lookup is by a separate
+// key view, so neither the query nor the key is ever copied. Matching is
+// case-sensitive byte equality (query keys are case-sensitive). The first
+// pair wins. Percent syntax is validated, not decoded, in v1: decoding
+// into a caller buffer is the documented next step (ARCHITECTURE.md).
+module web.query.v1;
+
+record PairOut { found: bool, value_start: u64, value_len: u64 }
+
+record QueryScan {
+    pair_start: u64,
+    eq_at: u64,
+    eq_seen: bool,
+    found: bool,
+    value_start: u64,
+    value_len: u64
+}
+
+fn byte_at(buf: [byte; up_to 1024], hlen: u64, idx: u64) -> (result: byte) {
+    if buf.len == 0 {
+        return 0;
+    }
+    if idx < hlen {
+        return buf[idx];
+    }
+    return 0;
+}
+
+fn scan_init(qstart: u64) -> (result: QueryScan) {
+    return QueryScan {
+        pair_start: qstart,
+        eq_at: 0,
+        eq_seen: false,
+        found: false,
+        value_start: 0,
+        value_len: 0
+    };
+}
+
+fn is_hex(value: byte) -> (result: bool) {
+    let n: i64 = value as i64;
+    if n >= 48 && n <= 57 {
+        return true;
+    }
+    if n >= 65 && n <= 70 {
+        return true;
+    }
+    return n >= 97 && n <= 102;
+}
+
+// Every '%' must open exactly two hex digits inside the window.
+fn pairs_valid(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    qstart: u64,
+    qlen: u64
+) -> (result: bool) {
+    if qlen == 0 {
+        return true;
+    }
+    if buf.len == 0 {
+        return false;
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if qstart >= hlen || qstart +% qlen > hlen {
+        return false;
+    }
+    iterate i over buf carrying ok: bool = true {
+        let live: bool = i < qlen && qstart +% i < hlen;
+        let slot: u64 = select(live, qstart +% i, 0);
+        let byte: byte = buf[slot];
+        next ok = ok && select(live, pct_ok(buf, hlen, qstart, qlen, i, byte), true);
+    }
+    return ok;
+}
+
+fn pct_ok(
+    buf: [byte; up_to 1024],
+    hlen: u64,
+    qstart: u64,
+    qlen: u64,
+    i: u64,
+    byte: byte
+) -> (result: bool) {
+    if byte == 37 {
+        if i +% 2 >= qlen {
+            return false;
+        }
+        let hi: byte = byte_at(buf, hlen, qstart +% i +% 1);
+        let lo: byte = byte_at(buf, hlen, qstart +% i +% 2);
+        return is_hex(hi) && is_hex(lo);
+    }
+    return true;
+}
+
+fn key_eq(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    start: u64,
+    len: u64,
+    key: [byte; up_to 32],
+    key_len: u64
+) -> (result: bool) {
+    if !(len == key_len) {
+        return false;
+    }
+    if buf.len == 0 || key.len == 0 {
+        return len == 0;
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    let khlen: u64 = select(key_len <= key.len, key_len, key.len);
+    if start +% len > hlen {
+        return false;
+    }
+    iterate i over buf carrying ok: bool = true {
+        let live: bool = i < len;
+        let aslot: u64 = select(live, start +% i, 0);
+        let bslot: u64 = select(live && i < khlen, i, 0);
+        next ok = ok && select(live, buf[aslot] == key[bslot], true);
+    }
+    return ok;
+}
+
+fn eval_pair(
+    scan: QueryScan,
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    pair_end: u64,
+    key: [byte; up_to 32],
+    key_len: u64
+) -> (result: QueryScan) {
+    if scan.found {
+        return scan;
+    }
+    let name_end: u64 = select(scan.eq_seen, scan.eq_at, pair_end);
+    let name_len: u64 = name_end -% scan.pair_start;
+    if !key_eq(buf, buflen, scan.pair_start, name_len, key, key_len) {
+        return scan;
+    }
+    let vstart: u64 = select(scan.eq_seen, scan.eq_at +% 1, pair_end);
+    let vlen: u64 = select(scan.eq_seen, pair_end -% (scan.eq_at +% 1), 0);
+    return QueryScan {
+        pair_start: scan.pair_start,
+        eq_at: scan.eq_at,
+        eq_seen: scan.eq_seen,
+        found: true,
+        value_start: vstart,
+        value_len: vlen
+    };
+}
+
+fn query_value(
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    qstart: u64,
+    qlen: u64,
+    key: [byte; up_to 32],
+    key_len: u64
+) -> (result: PairOut) {
+    if qlen == 0 || key_len == 0 {
+        return PairOut { found: false, value_start: 0, value_len: 0 };
+    }
+    if buf.len == 0 {
+        return PairOut { found: false, value_start: 0, value_len: 0 };
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if qstart >= hlen || qstart +% qlen > hlen {
+        return PairOut { found: false, value_start: 0, value_len: 0 };
+    }
+    iterate i over buf carrying scan: QueryScan = scan_init(qstart) {
+        let live: bool = i < qlen && qstart +% i < hlen && !scan.found;
+        let slot: u64 = select(live, qstart +% i, 0);
+        next scan = step_pair(scan, buf, buflen, qstart, i, slot, buf[slot], live, key, key_len);
+    }
+    let tail: QueryScan = eval_pair(scan, buf, buflen, qstart +% qlen, key, key_len);
+    return PairOut { found: tail.found, value_start: tail.value_start, value_len: tail.value_len };
+}
+
+fn step_pair(
+    scan: QueryScan,
+    buf: [byte; up_to 1024],
+    buflen: u64,
+    qstart: u64,
+    i: u64,
+    slot: u64,
+    byte: byte,
+    live: bool,
+    key: [byte; up_to 32],
+    key_len: u64
+) -> (result: QueryScan) {
+    if !live {
+        return scan;
+    }
+    if scan.found {
+        return scan;
+    }
+    if byte == 38 {
+        let closed: QueryScan = eval_pair(scan, buf, buflen, slot, key, key_len);
+        return QueryScan {
+            pair_start: slot +% 1,
+            eq_at: 0,
+            eq_seen: false,
+            found: closed.found,
+            value_start: closed.value_start,
+            value_len: closed.value_len
+        };
+    }
+    if byte == 61 && !scan.eq_seen {
+        return QueryScan {
+            pair_start: scan.pair_start,
+            eq_at: slot,
+            eq_seen: true,
+            found: false,
+            value_start: 0,
+            value_len: 0
+        };
+    }
+    return scan;
+}

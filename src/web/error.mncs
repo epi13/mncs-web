@@ -1,0 +1,198 @@
+mncs 0.13;
+
+// web.error — machine-readable web failure vocabulary (RFC 0001, pressure P-web-001).
+//
+// Every parser/transport/router failure in mncs-web is a value of `Error`,
+// never a trap and never an untyped string. FAIL-labeled control flow
+// (`fail`) is reserved for internal defects that indicate a bug in
+// mncs-web itself; hostile or malformed peer bytes always surface as data.
+//
+// The numeric codes are part of the cross-boundary contract: corpus-facing
+// functions report `error: u64` (flat ABI rule, see ARCHITECTURE.md) and
+// `code_of` / `error_of` convert at the boundary. Constructor functions
+// (`bad_method()` and friends) let other modules build `Error` values
+// through plain calls instead of qualified variant spellings.
+module web.error.v1;
+
+enum Error {
+    None_,
+    BadMethod,
+    BadTarget,
+    BadVersion,
+    BadStartLine,
+    BadHeader,
+    BadName,
+    BadSeparator,
+    BadContentLength,
+    TooLongStartLine,
+    TooLongHeader,
+    TooManyHeaders,
+    HeadTooLarge,
+    BodyTooLarge,
+    BadStatus,
+    Overflow,
+    UnsupportedTransfer
+}
+
+fn none() -> (result: Error) {
+    return Error.None_;
+}
+
+fn bad_method() -> (result: Error) {
+    return Error.BadMethod;
+}
+
+fn bad_target() -> (result: Error) {
+    return Error.BadTarget;
+}
+
+fn bad_version() -> (result: Error) {
+    return Error.BadVersion;
+}
+
+fn bad_start_line() -> (result: Error) {
+    return Error.BadStartLine;
+}
+
+fn bad_header() -> (result: Error) {
+    return Error.BadHeader;
+}
+
+fn bad_name() -> (result: Error) {
+    return Error.BadName;
+}
+
+fn bad_separator() -> (result: Error) {
+    return Error.BadSeparator;
+}
+
+fn bad_content_length() -> (result: Error) {
+    return Error.BadContentLength;
+}
+
+fn too_long_start_line() -> (result: Error) {
+    return Error.TooLongStartLine;
+}
+
+fn too_long_header() -> (result: Error) {
+    return Error.TooLongHeader;
+}
+
+fn too_many_headers() -> (result: Error) {
+    return Error.TooManyHeaders;
+}
+
+fn head_too_large() -> (result: Error) {
+    return Error.HeadTooLarge;
+}
+
+fn body_too_large() -> (result: Error) {
+    return Error.BodyTooLarge;
+}
+
+fn bad_status() -> (result: Error) {
+    return Error.BadStatus;
+}
+
+fn overflow() -> (result: Error) {
+    return Error.Overflow;
+}
+
+fn unsupported_transfer() -> (result: Error) {
+    return Error.UnsupportedTransfer;
+}
+
+// Stable boundary code. 0 means "no error".
+fn code_of(error: Error) -> (result: u64) {
+    return match error {
+        None_ => 0,
+        BadMethod => 1,
+        BadTarget => 2,
+        BadVersion => 3,
+        BadStartLine => 4,
+        BadHeader => 5,
+        BadName => 6,
+        BadSeparator => 7,
+        BadContentLength => 8,
+        TooLongStartLine => 9,
+        TooLongHeader => 10,
+        TooManyHeaders => 11,
+        HeadTooLarge => 12,
+        BodyTooLarge => 13,
+        BadStatus => 14,
+        Overflow => 15,
+        UnsupportedTransfer => 16,
+    };
+}
+
+fn error_of(code: u64) -> (result: Error) {
+    return match code {
+        1 => Error.BadMethod,
+        2 => Error.BadTarget,
+        3 => Error.BadVersion,
+        4 => Error.BadStartLine,
+        5 => Error.BadHeader,
+        6 => Error.BadName,
+        7 => Error.BadSeparator,
+        8 => Error.BadContentLength,
+        9 => Error.TooLongStartLine,
+        10 => Error.TooLongHeader,
+        11 => Error.TooManyHeaders,
+        12 => Error.HeadTooLarge,
+        13 => Error.BodyTooLarge,
+        14 => Error.BadStatus,
+        15 => Error.Overflow,
+        16 => Error.UnsupportedTransfer,
+        _ => Error.None_,
+    };
+}
+
+fn is_limit(error: Error) -> (result: bool) {
+    return match error {
+        TooLongStartLine => true,
+        TooLongHeader => true,
+        TooManyHeaders => true,
+        HeadTooLarge => true,
+        BodyTooLarge => true,
+        None_ => false,
+        BadMethod => false,
+        BadTarget => false,
+        BadVersion => false,
+        BadStartLine => false,
+        BadHeader => false,
+        BadName => false,
+        BadSeparator => false,
+        BadContentLength => false,
+        BadStatus => false,
+        Overflow => false,
+        UnsupportedTransfer => false,
+    };
+}
+
+// HTTP status a server should emit for a head-parse failure.
+// 0 (None_) maps to 0: the caller must never encode a "no error" outcome.
+fn status_for(error: Error) -> (result: u16) {
+    return match error {
+        None_ => 0,
+        BadMethod => 400,
+        BadTarget => 400,
+        BadVersion => 505,
+        BadStartLine => 400,
+        BadHeader => 400,
+        BadName => 400,
+        BadSeparator => 400,
+        BadContentLength => 400,
+        TooLongStartLine => 414,
+        TooLongHeader => 400,
+        TooManyHeaders => 431,
+        HeadTooLarge => 431,
+        BodyTooLarge => 413,
+        BadStatus => 500,
+        Overflow => 500,
+        UnsupportedTransfer => 501,
+    };
+}
+
+fn status_for_code(code: u64) -> (result: u16) {
+    return status_for(error_of(code));
+}

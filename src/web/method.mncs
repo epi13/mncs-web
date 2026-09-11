@@ -1,0 +1,248 @@
+mncs 0.13;
+
+// web.method — strongly modeled HTTP methods.
+//
+// Known methods are enum variants; anything else a peer sends is `EXT`,
+// the protocol extensibility escape hatch (RFC 9110 allows extension
+// methods). `parse` never fails: unrecognized tokens become `EXT`, while
+// `token_valid` separately reports whether the token used legal `tchar`
+// bytes, so the parser can reject garbage (BadMethod) without losing
+// well-formed extensions.
+//
+// All scanners take the shared wire view plus explicit offsets. Loads go
+// through `byte_at`, which is total: out-of-range reads yield 0 instead of
+// trapping, and every caller checks spans before comparing.
+module web.method.v1;
+
+enum Method {
+    GET,
+    POST,
+    PUT,
+    DELETE,
+    HEAD,
+    OPTIONS,
+    PATCH,
+    TRACE,
+    CONNECT,
+    EXT
+}
+
+record MethodText { data: [byte; 8], length: u64 }
+
+// Total load: 0 outside the valid window, never a trap.
+fn byte_at(buf: [byte; up_to 1024], buflen: u64, idx: u64) -> (result: byte) {
+    if buf.len == 0 {
+        return 0;
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if idx < hlen {
+        return buf[idx];
+    }
+    return 0;
+}
+
+fn code_of(method: Method) -> (result: u64) {
+    return match method {
+        GET => 0,
+        POST => 1,
+        PUT => 2,
+        DELETE => 3,
+        HEAD => 4,
+        OPTIONS => 5,
+        PATCH => 6,
+        TRACE => 7,
+        CONNECT => 8,
+        EXT => 9,
+    };
+}
+
+fn method_of(code: u64) -> (result: Method) {
+    return match code {
+        0 => Method.GET,
+        1 => Method.POST,
+        2 => Method.PUT,
+        3 => Method.DELETE,
+        4 => Method.HEAD,
+        5 => Method.OPTIONS,
+        6 => Method.PATCH,
+        7 => Method.TRACE,
+        8 => Method.CONNECT,
+        _ => Method.EXT,
+    };
+}
+
+// RFC 9110 "safe" methods: read-only by definition.
+fn is_safe(method: Method) -> (result: bool) {
+    return match method {
+        GET => true,
+        HEAD => true,
+        OPTIONS => true,
+        TRACE => true,
+        POST => false,
+        PUT => false,
+        DELETE => false,
+        PATCH => false,
+        CONNECT => false,
+        EXT => false,
+    };
+}
+
+// RFC 9110 idempotent methods. EXT is conservatively non-idempotent:
+// an unknown method must not be retried on the assumption of safety.
+fn is_idempotent(method: Method) -> (result: bool) {
+    return match method {
+        GET => true,
+        HEAD => true,
+        OPTIONS => true,
+        TRACE => true,
+        PUT => true,
+        DELETE => true,
+        POST => false,
+        PATCH => false,
+        CONNECT => false,
+        EXT => false,
+    };
+}
+
+fn is_token_char(value: byte) -> (result: bool) {
+    let n: i64 = value as i64;
+    let alpha: bool = (n >= 65 && n <= 90) || (n >= 97 && n <= 122);
+    let digit: bool = n >= 48 && n <= 57;
+    let symbol: bool = n == 33 || n == 35 || n == 36 || n == 37
+        || n == 38 || n == 39 || n == 42 || n == 43 || n == 45
+        || n == 46 || n == 94 || n == 95 || n == 96 || n == 124
+        || n == 126;
+    return alpha || digit || symbol;
+}
+
+// A method token is 1..=16 tchar bytes. Longer tokens are rejected here
+// (the parser reports TooLongStartLine once the line limit trips first;
+// this bound keeps EXT spans small and lookup loops cheap).
+fn token_valid(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64
+) -> (result: bool) {
+    if len == 0 || len > 16 {
+        return false;
+    }
+    if buf.len == 0 {
+        return false;
+    }
+    let hlen: u64 = select(buflen <= buf.len, buflen, buf.len);
+    if start >= hlen {
+        return false;
+    }
+    // start < hlen <= 1024 and len <= 16, so start +% len cannot wrap and
+    // the token window check below is exact.
+    if start +% len > hlen {
+        return false;
+    }
+    iterate i over buf carrying ok: bool = true {
+        let live: bool = i < len;
+        // When live, slot = start +% i < start +% len <= hlen <= buf.len,
+        // so the projection is always in bounds; otherwise slot is 0,
+        // which is valid because buf.len >= 1 here. Both `select`
+        // candidates therefore evaluate safely (select is strict).
+        let slot: u64 = select(live, start +% i, 0);
+        next ok = ok && select(live, is_token_char(buf[slot]), true);
+    }
+    return ok;
+}
+
+fn load3(
+    buf: [byte; up_to 1024],
+    start: u64,
+    buflen: u64,
+    a: byte,
+    b: byte,
+    c: byte
+) -> (result: bool) {
+    return byte_at(buf, buflen, start) == a
+        && byte_at(buf, buflen, start +% 1) == b
+        && byte_at(buf, buflen, start +% 2) == c;
+}
+
+fn parse(
+    buf: [byte; up_to 1024],
+    start: u64,
+    len: u64,
+    buflen: u64
+) -> (result: Method) {
+    if len == 3 {
+        if load3(buf, start, buflen, 71, 69, 84) {
+            return Method.GET;
+        }
+        if load3(buf, start, buflen, 80, 85, 84) {
+            return Method.PUT;
+        }
+        return Method.EXT;
+    }
+    if len == 4 {
+        if load3(buf, start, buflen, 80, 79, 83)
+            && byte_at(buf, buflen, start +% 3) == 84 {
+            return Method.POST;
+        }
+        if load3(buf, start, buflen, 72, 69, 65)
+            && byte_at(buf, buflen, start +% 3) == 68 {
+            return Method.HEAD;
+        }
+        return Method.EXT;
+    }
+    if len == 5 {
+        if load3(buf, start, buflen, 80, 65, 84)
+            && byte_at(buf, buflen, start +% 3) == 67
+            && byte_at(buf, buflen, start +% 4) == 72 {
+            return Method.PATCH;
+        }
+        if load3(buf, start, buflen, 84, 82, 65)
+            && byte_at(buf, buflen, start +% 3) == 67
+            && byte_at(buf, buflen, start +% 4) == 69 {
+            return Method.TRACE;
+        }
+        return Method.EXT;
+    }
+    if len == 6 {
+        if load3(buf, start, buflen, 68, 69, 76)
+            && load3(buf, start +% 3, buflen, 69, 84, 69) {
+            return Method.DELETE;
+        }
+        return Method.EXT;
+    }
+    if len == 7 {
+        if load3(buf, start, buflen, 79, 80, 84)
+            && byte_at(buf, buflen, start +% 3) == 73
+            && byte_at(buf, buflen, start +% 4) == 79
+            && byte_at(buf, buflen, start +% 5) == 78
+            && byte_at(buf, buflen, start +% 6) == 83 {
+            return Method.OPTIONS;
+        }
+        if load3(buf, start, buflen, 67, 79, 78)
+            && byte_at(buf, buflen, start +% 3) == 78
+            && byte_at(buf, buflen, start +% 4) == 69
+            && byte_at(buf, buflen, start +% 5) == 67
+            && byte_at(buf, buflen, start +% 6) == 84 {
+            return Method.CONNECT;
+        }
+        return Method.EXT;
+    }
+    return Method.EXT;
+}
+
+// Padded spelling for the encoder: `data` always has 8 slots, `length`
+// says how many are live. Padding is zero, never spaces.
+fn text(method: Method) -> (result: MethodText) {
+    return match method {
+        GET => MethodText { data: [71, 69, 84, 0, 0, 0, 0, 0], length: 3 },
+        POST => MethodText { data: [80, 79, 83, 84, 0, 0, 0, 0], length: 4 },
+        PUT => MethodText { data: [80, 85, 84, 0, 0, 0, 0, 0], length: 3 },
+        DELETE => MethodText { data: [68, 69, 76, 69, 84, 69, 0, 0], length: 6 },
+        HEAD => MethodText { data: [72, 69, 65, 68, 0, 0, 0, 0], length: 4 },
+        OPTIONS => MethodText { data: [79, 80, 84, 73, 79, 78, 83, 0], length: 7 },
+        PATCH => MethodText { data: [80, 65, 84, 67, 72, 0, 0, 0], length: 5 },
+        TRACE => MethodText { data: [84, 82, 65, 67, 69, 0, 0, 0], length: 5 },
+        CONNECT => MethodText { data: [67, 79, 78, 78, 69, 67, 84, 0], length: 7 },
+        EXT => MethodText { data: [0, 0, 0, 0, 0, 0, 0, 0], length: 0 },
+    };
+}

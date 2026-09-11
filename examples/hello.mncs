@@ -1,0 +1,65 @@
+mncs 0.13;
+
+// Example: the smallest end-to-end mncs-web service interaction.
+//
+// A host owns bytes; mncs-web owns meaning. This module shows the whole
+// round trip as pure calls a host (or test) can drive: hand
+// `serve_bytes` a request, get response bytes back. No sockets, no
+// mocks, no framework: parse -> route -> handler -> encode.
+//
+// Executed by tests/test_examples.py on every backend.
+module ex.hello.v1;
+
+use web.app as app;
+use web.encode as encode;
+
+fn health_request() -> (result: [byte; 38]) {
+    return [
+        71, 69, 84, 32, 47, 104, 101, 97, 108, 116, 104, 32, 72, 84, 84, 80, 47, 49, 46, 49, 13, 10,
+        72, 111, 115, 116, 58, 32, 104, 13, 10, 13, 10, 0, 0, 0, 0, 0
+    ];
+}
+
+fn user_request() -> (result: [byte; 30]) {
+    return [
+        71, 69, 84, 32, 47, 117, 115, 101, 114, 115, 47, 55, 32, 72, 84, 84, 80, 47, 49, 46, 49, 13, 10,
+        13, 10, 0, 0, 0, 0, 0
+    ];
+}
+
+fn missing_request() -> (result: [byte; 28]) {
+    return [
+        71, 69, 84, 32, 47, 110, 111, 112, 101, 32, 72, 84, 84, 80, 47, 49, 46, 49, 13, 10,
+        13, 10, 0, 0, 0, 0, 0, 0
+    ];
+}
+
+fn entry_health_status() -> (result: u16) {
+    let req: [byte; 38] = health_request();
+    let served: app.ServeOut = app.serve_once(req, 33, 512, 512, 32, 1024, 1024);
+    return served.status;
+}
+
+fn entry_health_body_len() -> (result: u64) {
+    let req: [byte; 38] = health_request();
+    let served: app.ServeOut = app.serve_once(req, 33, 512, 512, 32, 1024, 1024);
+    return served.body_len;
+}
+
+fn entry_user_status() -> (result: u16) {
+    let req: [byte; 30] = user_request();
+    let served: app.ServeOut = app.serve_once(req, 25, 512, 512, 32, 1024, 1024);
+    return served.status;
+}
+
+fn entry_missing_status() -> (result: u16) {
+    let req: [byte; 28] = missing_request();
+    let served: app.ServeOut = app.serve_once(req, 22, 512, 512, 32, 1024, 1024);
+    return served.status;
+}
+
+fn entry_health_wire_len() -> (result: u64) {
+    let req: [byte; 38] = health_request();
+    let wire: encode.EncodeOut = app.serve_bytes(req, 33, 512, 512, 32, 1024, 1024);
+    return wire.length;
+}

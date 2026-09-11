@@ -1,0 +1,19 @@
+mncs 0.13;
+
+// Reproducer for WEB-P-006: slicing a bounded view cannot narrow its
+// capacity. The derived slice keeps `[byte; up_to 1024]` and fails to
+// satisfy `[byte; up_to 64]` with MNE188, even when the runtime range
+// fits. There is no way to lend a sub-window at a smaller static bound.
+//
+// mncs-web workaround: every byte-oriented helper in all 15 modules
+// takes the widest capacity `[byte; up_to 1024]` plus explicit
+// (start, length) spans; narrowing never happens.
+module repro.view_narrow;
+
+fn take_narrow(buf: [byte; up_to 64], len: u64) -> (result: u64) {
+    return buf.len;
+}
+
+fn slice_narrow(buf: [byte; up_to 1024], start: u64, end: u64) -> (result: u64) {
+    return take_narrow(buf[start..end], end -% start);
+}

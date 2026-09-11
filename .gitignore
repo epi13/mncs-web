@@ -1,0 +1,6 @@
+# Generated / local-only artifacts. Everything else is source.
+tests/target/
+__pycache__/
+*.pyc
+.pytest_cache/
+target/

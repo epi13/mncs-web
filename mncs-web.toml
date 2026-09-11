@@ -1,0 +1,47 @@
+version = 1
+
+[project]
+name = "mncs-web"
+identity = "mncs-web-0.1-foundation"
+root = "."
+language_profile = "0.13"
+toolchain = "mncs-language (external, read-only)"
+
+[paths]
+sources = ["src/web"]
+tests = ["tests/corpora"]
+examples = ["examples"]
+benchmarks = ["benchmarks"]
+docs = ["docs"]
+rfcs = ["docs/rfcs"]
+reproducers = ["repro"]
+generated = ["target"]
+
+[backends]
+executable = [
+  "mncs-research-bytecode",
+  "mncs-portable-wasm-mvp",
+  "mncs-c11",
+  "mncs-llvm-ir",
+  "mncs-cranelift",
+]
+# Fast backends run in the default suite (no external toolchain).
+# Set MNCS_BACKENDS to run the full matrix explicitly.
+
+[limits]
+corpus_step_budget = 200000
+max_sequence_bound = 1024
+max_vector_lanes = 64
+counted_bound_per_level = 1024
+nesting_levels = 2
+
+[capacities]
+wire_buffer = 1024
+header_block = 32
+feed_chunk = 256
+encoder_output = 1024
+reason_slot = 32
+method_slot = 8
+response_body = 256
+routes = 16
+route_pattern = 32
