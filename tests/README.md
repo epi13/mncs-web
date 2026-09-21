@@ -68,19 +68,19 @@ type identities keyed by source hash (regenerated automatically).
 ## Backend chunk-coverage (WEB-P-012)
 
 `test_fragmentation.py` runs the full 1/5/64-byte chunk battery on
-bytecode. Other backends run the within-ceiling subset; excluded sizes
-print a `SKIP ... (WEB-P-012)` line per test (visible with `-s`) and
-are tabulated here — reported, never silent:
+bytecode and portable WASM. C11/LLVM/Cranelift run the within-ceiling
+subset; excluded sizes print a `SKIP ... (WEB-P-012)` line per test
+(visible with `-s`) and are tabulated here — reported, never silent.
 
 | message | size 1 (live) | size 5 (live) | size 64 (live) |
 |---|---|---|---|
-| min 37 B | bytecode only (37) | bytecode + wasm (8) | all (1) |
-| post 57 B | bytecode only (57) | bytecode + wasm (12) | all (1) |
-| multi 96 B | bytecode only (96) | bytecode only (20) | all (2) |
+| min 37 B | bytecode + wasm (37) | bytecode + wasm (8) | all (1) |
+| post 57 B | bytecode + wasm (57) | bytecode + wasm (12) | all (1) |
+| multi 96 B | bytecode + wasm (96) | bytecode + wasm (20) | all (2) |
 
-Ceilings (live chunks, verified by execution): bytecode unlimited;
-wasm 12 (12 pass / 13 trap); c11, llvm-ir, cranelift 2 (1-2 pass;
-c11 fails at 10; llvm/cranelift unprobed above 2). Unknown backends
+The 13-live-chunk reproducer in `repro/feed-chunk-trap.py` now returns
+on all five executable backends; the remaining ceiling is the larger
+arena cost of 37+ live chunks on C11/LLVM/Cranelift. Unknown backends
 fail closed in `allowed_chunk_sizes`.
 
 ## Backend policy

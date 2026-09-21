@@ -58,18 +58,14 @@ def head_key(head):
 
 CHUNK_SIZES = (1, 5, 64)
 
-# Maximum live fold_feed chunks per backend, verified by execution.
-# Native backends trap past small staging counts (WEB-P-012): wasm
-# traps at 13+ live chunks (12 verified good), c11 fails at 10 with an
-# opaque runtime_failure (2 verified good), llvm/cranelift verified
-# good to 2 live chunks (upper range unprobed). The full convergence
-# battery runs on bytecode; other backends run the within-ceiling
-# subset and REPORT every excluded size (print + README table), never
-# silently. Unknown backends fail closed here so a new backend gets an
-# explicit ceiling decision instead of a reduced battery by accident.
+# Native backends no longer fail at the former 13-live-chunk source-address
+# trigger after inactive source lanes were clamped in `copy_span`. The
+# remaining resource ceiling is narrower: portable WASM runs the complete
+# battery, while C11/LLVM/Cranelift still exhaust their bounded native arena
+# above two live chunks. Keep the cap explicit and report every excluded case.
 BACKEND_LIVE_CAP = {
     "mncs-research-bytecode": None,
-    "mncs-portable-wasm-mvp": 12,
+    "mncs-portable-wasm-mvp": None,
     "mncs-c11": 2,
     "mncs-llvm-ir": 2,
     "mncs-cranelift": 2,
