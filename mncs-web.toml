@@ -4,7 +4,7 @@ version = 1
 name = "mncs-web"
 identity = "mncs-web-0.1-foundation"
 root = "."
-language_profile = "0.13"
+language_profile = "0.14"
 toolchain = "mncs-language (external, read-only)"
 
 [paths]
