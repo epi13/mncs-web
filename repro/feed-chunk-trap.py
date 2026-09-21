@@ -1,11 +1,11 @@
-"""Reproducer for WEB-P-012: native backends trap past small staging counts.
+"""Regression witness for the former WEB-P-012 native staging trap.
 
 Runs `feed_pattern` twice on the same backend: a 5-live-chunk control
 (5 B message, chunk size 1) and a 13-live-chunk trigger (37 B message,
-chunk size 3). Expected: both `returned`. Actual: the control returns
-everywhere; the trigger returns only on mncs-research-bytecode and
-dies on every native backend (wasm: out-of-bounds store trap;
-cranelift: arena exhaustion; c11/llvm: bare runtime_failure).
+chunk size 3). Both cases must return on every executable backend. The
+former failure was caused by eager source loads in the branchless
+`copy_span` lowering; inactive source lanes now clamp their index before
+the load.
 
 Usage (from the mncs-web repo root):
     python3 repro/feed-chunk-trap.py [backend]

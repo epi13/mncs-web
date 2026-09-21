@@ -153,9 +153,11 @@ mncs-media, mncs-crypto (block ops).
 
 Evidence/tests: `src/web/encode.mncs` (`emit_span`),
 `src/web/parser.mncs` (`stage_append`), source-study for every web module,
-and the encoder/fragmentation consumer suite on the research-bytecode
-backend. The remaining fragmentation runtime is recorded as
-`WEB-P-004`/`WEB-P-012` performance pressure rather than hidden.
+the `mncs-language` `pressure-span-copy` corpus across all executable
+backends, and the encoder consumer suite across the web backend matrix.
+The remaining fragmentation cost is the independent static traversal
+pressure in `WEB-P-004` plus the residual native arena ceiling in
+`WEB-P-012`.
 
 ## WEB-P-004 — Bounded iteration always pays the static capacity
 
@@ -498,69 +500,41 @@ wasm `invalid_request` failures in the pre-fix full-matrix log
 (`test_header_block_ops`, `test_custom_table_priority_and_wildcard`,
 `test_parser_record_paths`).
 
-## WEB-P-012 — Native backends trap past small feed-staging counts
+## WEB-P-012 — Native backends trap past small feed-staging counts (partially resolved)
 
-- Status: open
-- Severity: major (the full chunk-convergence battery can only run on
-  the interpreter; every native backend needs a reduced matrix)
+- Status: partially resolved; residual native-arena pressure remains open
+- Severity: major (cross-backend convergence still has a native ceiling)
 - Category: compiler/backends (codegen resource scaling)
 
-What mncs-web was trying to implement: chunk-size convergence —
-`feed_pattern` staging the same message in 1, 5, and 64-byte pieces
-must converge with the one-shot parse, on every backend.
+The historical 5-live control / 13-live trigger had two overlapping
+causes. The branchless `copy_span` lowering eagerly loaded a source
+lane even when the lane was outside the destination window;
+`lane - dst_at` could therefore wrap into a negative address when the
+source was an externally supplied packed byte view. Separately, larger
+native runs exhaust the bounded canonical-cell arena.
 
-Expected behavior: staging N chunks costs steps, not soundness. Past
-any resource limit the backend should report budget exhaustion (or a
-named resource error), identically to the interpreter.
+Resolution to date: the canonical WASM lowering now clamps the source
+index to zero for inactive lanes while retaining the checked source
+index for lanes inside the requested window. The fix is backend-neutral
+in semantics and is pinned by `external_view_large_offset` in the
+`pressure-span-copy` corpus. The former 13-live trigger now returns on
+all five executable backends, and portable WASM runs the complete
+1/5/64-byte chunk battery. C11/LLVM/Cranelift still exhaust their
+bounded native arena above two live chunks, but now return the named
+`MNCS_RSRC_EXHAUSTED` status rather than the old opaque trap/null
+reason.
 
-Actual behavior: past a small, backend-specific live-chunk count, the
-same corpus that converges on `mncs-research-bytecode` dies on every
-native backend, each in its own way:
-- `mncs-portable-wasm-mvp`: `runtime_failure: backend trap:
-  out-of-bounds memory store` at 13+ live chunks (12 verified good).
-- `mncs-cranelift`: `cranelift JIT cell access exceeded the arena
-  image; failing closed` (same 13-chunk trigger).
-- `mncs-c11` / `mncs-llvm-ir`: bare `runtime_failure` with null
-  reason at 1 step — no diagnostic at all (10 live chunks fails; 1-2
-  verified good).
-Verified brackets (live `fold_feed` chunks, 37 B message unless
-noted): wasm 12 pass / 13 trap; c11 1 pass / 10 fail; llvm and
-cranelift 2 pass (upper range unprobed); 5 B message at chunk size 1
-(5 live) passes on wasm. The trigger tracks live-chunk count, not
-message bytes (23 B in 12 chunks passes; 37 B in 13 chunks traps).
+Current workaround: `BACKEND_LIVE_CAP` remains explicit in
+`tests/test_fragmentation.py` (bytecode/WASM complete; C11/LLVM/Cranelift
+two live chunks), with every excluded size printed and tabulated. The
+remaining static-capacity cost is tracked separately as `WEB-P-004`.
 
-Why this is a language/runtime issue: identical MNCS source
-traps/fails-opaquely on native backends while the reference
-interpreter converges. Application code cannot distinguish "too many
-chunks" from correct code, and two backends give no actionable
-diagnostic (null reason; arena internals). Suspected family:
-loop-carried large-array temporaries (`build_chunk` 256 B carrier +
-1024 B staged copies per live chunk) exhausting per-backend
-memory/arena sizing — but that is a guess from symptoms, for the
-backend owners to confirm.
-
-Current workaround: per-backend live-chunk ceilings in
-`tests/test_fragmentation.py` (`BACKEND_LIVE_CAP`: bytecode full
-battery; wasm 12; c11/llvm/cranelift 2), with every excluded
-(chunk-size, backend) pair printed and tabulated instead of silently
-skipped. Unknown backends fail closed (explicit ceiling required).
-
-Cost of the workaround: convergence is proved in full only on the
-interpreter; native-backend portability covers 1-12 chunks depending
-on backend. If backend ceilings move, the caps must be re-verified by
-execution (the table records exactly what was verified).
-
-Desired capability: native backends stage arbitrary chunk counts
-like the interpreter, or refuse with a named, actionable resource
-error — never a trap or a null-reason failure.
-
-Other projects likely affected: any project looping over
-large-array temporaries on native backends (mncs-store chunking,
-mncs-media frames).
-
-Evidence/tests: `repro/feed-chunk-trap.py` (5-live control +
-13-live trigger on any backend); `BACKEND_LIVE_CAP` and SKIP lines in
-`tests/test_fragmentation.py`; coverage table in `tests/README.md`.
+Evidence/tests: `repro/feed-chunk-trap.py` returns both the 5-live
+control and 13-live trigger on all five executable backends; the
+uncapped chunk matrix passes 6 cases and reaches the named native arena
+limit on 9 cases; `mncs-language` `da71b8c` / main descendant contains
+the lowering fix. The unresolved portion is native arena scaling, not
+a missing source construct.
 
 ## Investigated but rejected (not language pressures)
 
