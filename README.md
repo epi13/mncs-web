@@ -33,7 +33,7 @@ The framework should expose enough structure for MNCS tooling to reason about ro
 
 ## Repository layout
 
-- `src/web/` — MNCS implementation (Profile 0.13, 15 modules)
+- `src/web/` — MNCS implementation (Profile 0.14, 15 modules)
 - `tests/` — pytest suite driving real MNCS executions (`tests/README.md`)
 - `repro/` — minimized language reproducers backing pressure entries
 - `docs/ARCHITECTURE.md` — architectural boundaries and decisions

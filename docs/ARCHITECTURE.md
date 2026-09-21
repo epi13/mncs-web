@@ -7,8 +7,10 @@ language pressure rather than hidden behind foreign substitutes.
 
 ## Status
 
-Foundation vertical slice implemented (all in `mncs-language`,
-Profile 0.13, executed on all compilable backends):
+Foundation vertical slice implemented (all in `mncs-language`; the
+buffer-pipeline modules use Profile 0.14, while unchanged leaves remain
+on their earlier compatible profiles, executed on all compilable
+backends):
 
 ```text
 typed protocol structures (method/status/version/uri/headers/limits/errors)
@@ -62,7 +64,7 @@ responsibilities differently than a borrow-based design:
 - The **caller retains bytes** (owns the wire buffer outright).
 - The **`Scan` value retains offsets** (phase + token/header/body spans).
 - The **`Parser` value retains staged copies** for incremental hosts
-  (append by copy; the 1024-byte staging cap bounds the cost).
+  (Profile 0.14 `copy_span`; the 1024-byte staging cap bounds the cost).
 - **Spans never outlive their buffer** because every function takes the
   buffer alongside the spans it interprets. There is nothing to borrow.
 

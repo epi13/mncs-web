@@ -1,4 +1,4 @@
-mncs 0.13;
+mncs 0.14;
 
 // web.parser — incremental HTTP/1.x head parser as an explicit state machine.
 //
@@ -778,15 +778,12 @@ fn stage_append(
         return StageAcc { staged: staged, len: staged_len };
     }
     let take: u64 = select(n <= chunk.len, n, chunk.len);
-    // Caller guarantees staged_len +% take <= 1024, so every live slot
-    // below is in bounds; slot 0 (valid: staged has 1024 slots) covers
-    // the dead iterations that strict `select` still evaluates.
-    iterate j over chunk carrying acc: [byte; 1024] = staged {
-        let live: bool = j < take;
-        let slot: u64 = select(live, staged_len +% j, 0);
-        next acc = select(live, replace(acc, slot, chunk[j]), acc);
-    }
-    return StageAcc { staged: acc, len: staged_len +% take };
+    // The caller proves staged_len + take <= 1024 before reaching this
+    // helper. Profile 0.14 keeps that bounded window as one canonical
+    // sequence operation instead of rebuilding the full staging value per
+    // byte.
+    let moved: [byte; 1024] = copy_span(staged, staged_len, chunk, 0, take);
+    return StageAcc { staged: moved, len: staged_len +% take };
 }
 
 fn clamp_take(chunk_len: u64, have: u64) -> (result: u64) {

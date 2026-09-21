@@ -1,4 +1,4 @@
-mncs 0.13;
+mncs 0.14;
 
 // web.encode — HTTP/1.x request/response serializers.
 //
@@ -7,10 +7,9 @@ mncs 0.13;
 // length); overflow saturates and reports `truncated` instead of
 // trapping, so a too-small build never becomes a memory error.
 //
-// Deliberate O(n*m) shape note: without a bulk slice-copy primitive,
-// every byte is placed with one `replace`. The code is correct and
-// bounded, but a `copy_span` primitive would collapse each span emission
-// from O(cap) replaces to one. See pressure WEB-P-003.
+// Span emission uses the Profile 0.14 bounded copy primitive. The parser
+// hands this encoder explicit source lengths, so malformed spans remain a
+// deterministic truncation while valid spans lower as one bounded move.
 module web.encode.v1;
 
 use web.headers as headers;
@@ -56,13 +55,26 @@ fn emit_span(
     if src.len == 0 {
         return e;
     }
-    let hlen: u64 = select(srclen <= src.len, srclen, src.len);
-    iterate i over src carrying acc: Emit = e {
-        let live: bool = i < len && start +% i < hlen;
-        let slot: u64 = select(live, start +% i, 0);
-        next acc = select(live, emit_byte(acc, src[slot]), acc);
+    if len == 0 {
+        return e;
     }
-    return acc;
+    if e.len >= 1024 {
+        return Emit { data: e.data, len: e.len, truncated: true };
+    }
+    let hlen: u64 = select(srclen <= src.len, srclen, src.len);
+    if start >= hlen {
+        return Emit { data: e.data, len: e.len, truncated: true };
+    }
+    let source_room: u64 = hlen -% start;
+    let destination_room: u64 = 1024 -% e.len;
+    let source_take: u64 = select(len <= source_room, len, source_room);
+    let take: u64 = select(source_take <= destination_room, source_take, destination_room);
+    let moved: [byte; 1024] = copy_span(e.data, e.len, src, start, take);
+    return Emit {
+        data: moved,
+        len: e.len +% take,
+        truncated: e.truncated || take < len
+    };
 }
 
 // Emit the live prefix of an 8-byte table slot (method/version text).

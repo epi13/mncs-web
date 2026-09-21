@@ -110,9 +110,9 @@ records — i.e. all three confirmed parser-like workloads.
 Evidence/tests: `repro/borrow-field-view.mncs` (1 error, MNE163);
 workaround sites pass the full suite (`tests/test_fragmentation.py`).
 
-## WEB-P-003 — No bulk span-copy primitive (replace-per-byte emission)
+## WEB-P-003 — Bulk span-copy primitive (resolved)
 
-- Status: open
+- Status: resolved in the current consumer
 - Severity: minor (correctness unaffected; performance and step budgets)
 - Category: stdlib / optimizer / memory (buffers/slices)
 
@@ -123,32 +123,39 @@ single bounded operations.
 Expected behavior: a total `copy_span(dst, dst_at, src, src_at, len)`
 with explicit bounds failure, compiling to a memmove-like backend op.
 
-Actual behavior: no such primitive exists in `mncs.core`/`mncs.std`;
-every byte is placed with one `replace` (each `replace` rebuilds the
-1024-byte value semantically). `feed_pattern` with 1-byte chunks over a
-37-byte message needs a ~1M step budget; the same logic with bulk copies
-would be ~2 orders of magnitude cheaper in steps.
+Resolution: Profile 0.14 provides the canonical compiler-owned
+`copy_span` operation. `src/web/encode.mncs::emit_span` and
+`src/web/parser.mncs::stage_append` now use it for valid bounded windows;
+malformed encoder spans still return the existing explicit truncation
+verdict before invoking the operation. The source and destination remain
+functional values, and all five executable backends retain the same
+bounded-copy semantics.
 
 Why this is a language/stdlib issue: only the compiler can provide a
 bounds-checked bulk op that lowers efficiently on all five backends;
 user code cannot beat per-element `replace` in step cost.
 
-Current workaround: per-byte `replace` loops with strict-`select`
-gating (total, no traps). Budgets sized accordingly
-(`feed_pattern` cases run at 1M steps).
+The previous per-byte `replace` workaround is removed from these two
+consumer paths. `WEB-P-004` remains separate: traversal still pays its
+static capacity even though each live append is now a bulk copy.
 
-Cost of the workaround: step-budget inflation for all chunked paths;
-host-side O(n*m) byte movement in tests; future throughput work will
-hit this wall first.
+Historical cost of the workaround: step-budget inflation for all
+chunked paths and host-side O(n*m) byte movement in tests. The remaining
+cost is the independent static-traversal pressure in `WEB-P-004`, not
+semantic byte movement in these two consumers.
 
-Desired capability: `mncs.core`/`mncs.std` bounded `copy_span` (or
-`blit`) with identical semantics on all backends.
+The canonical capability is `copy_span(dst, dst_at, src, src_at, len)`
+in language Profile 0.14; no application-local `blit` authority is
+retained.
 
 Other projects likely affected: mncs-store (frame building),
 mncs-media, mncs-crypto (block ops).
 
-Evidence/tests: `src/web/encode.mncs` (`emit_span`), step-budget data
-in `tests/test_fragmentation.py` (1M budget for 1-byte feeds).
+Evidence/tests: `src/web/encode.mncs` (`emit_span`),
+`src/web/parser.mncs` (`stage_append`), source-study for every web module,
+and the encoder/fragmentation consumer suite on the research-bytecode
+backend. The remaining fragmentation runtime is recorded as
+`WEB-P-004`/`WEB-P-012` performance pressure rather than hidden.
 
 ## WEB-P-004 — Bounded iteration always pays the static capacity
 
