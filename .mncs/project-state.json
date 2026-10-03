@@ -1,0 +1,17 @@
+{
+  "schema_version": "mncs.project-intent/1",
+  "purpose": "Machine-native web application infrastructure for MNCS: concise HTTP/web-service development with explicit machine semantics, typed effects, deterministic behavior, and inspectable execution.",
+  "entry": [
+    "bash scripts/run_suite.sh"
+  ],
+  "milestones": [
+    {
+      "id": "mncs-web:projection-conformance",
+      "title": "Declared ambient projection surfaces satisfy their contract",
+      "subject_slot": "declarations",
+      "evidence": "projection-conformance",
+      "dependencies": [],
+      "blockers": []
+    }
+  ]
+}

@@ -1,5 +1,8 @@
 # mncs-web
 
+<!-- MNCS:generated:begin -->
+<!-- MNCS:generated:end -->
+
 Machine-native web application infrastructure for MNCS.
 
 `mncs-web` is an application-level pressure project for `mncs-language`: it should make ordinary HTTP and web-service development concise without giving up explicit machine semantics, typed effects, deterministic behavior where requested, or inspectable execution.
