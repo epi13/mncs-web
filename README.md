@@ -1,6 +1,19 @@
 # mncs-web
 
 <!-- MNCS:generated:begin -->
+## Project entry
+
+Machine-native web application infrastructure for MNCS: concise HTTP/web-service development with explicit machine semantics, typed effects, deterministic behavior, and inspectable execution.
+
+```bash
+bash scripts/run_suite.sh
+```
+
+Declared capabilities (declarations do not establish execution health):
+
+- `web-framework/0.1` — mncs-library (experimental)
+
+Semantic sources and ownership: `.mncs/projections.json`.
 <!-- MNCS:generated:end -->
 
 Machine-native web application infrastructure for MNCS.

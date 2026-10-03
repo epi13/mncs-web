@@ -1,0 +1,22 @@
+{
+  "capabilities": [
+    {
+      "contract": "web-framework",
+      "fingerprint_sources": [
+        "src/web/"
+      ],
+      "kind": "mncs-library",
+      "stability": "experimental",
+      "version": "0.1"
+    }
+  ],
+  "dependencies": [],
+  "entry": [
+    "bash scripts/run_suite.sh"
+  ],
+  "purpose": "Machine-native web application infrastructure for MNCS: concise HTTP/web-service development with explicit machine semantics, typed effects, deterministic behavior, and inspectable execution.",
+  "repository": "mncs-web",
+  "schema_version": "mncs.project-view/1",
+  "source_identity": "sha256:22387776adfd6dab439d86ae2e517eab8896f248c34d7f80e44f48f2b2d9eeb0",
+  "structure": {}
+}
